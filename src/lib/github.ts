@@ -21,6 +21,7 @@ const MAX_COMMITS_PER_AUTHOR = 200;
 type CommitNode = {
   oid: string;
   messageHeadline: string;
+  message: string;
   url: string;
   additions: number;
   deletions: number;
@@ -67,6 +68,7 @@ const COMMIT_HISTORY_QUERY = /* GraphQL */ `
               nodes {
                 oid
                 messageHeadline
+                message
                 url
                 additions
                 deletions
@@ -241,61 +243,196 @@ async function adjustCommit(
   return { node: c, additions, deletions, excludedFiles: excluded };
 }
 
-function aggregateAdjusted(commits: AdjustedCommit[], repoFullName: string): Racer[] {
-  const byKey = new Map<string, Racer>();
+type Contributor = {
+  key: string;
+  login: string;
+  avatarUrl: string;
+  htmlUrl: string;
+};
+
+// GitHub auto-generates noreply emails like "12345+username@users.noreply.github.com"
+// for co-authoring suggestions in PR reviews. We can extract the login from these
+// reliably. For other emails, we fall back to a per-repo email -> user map built
+// from primary authors who DID have user.login resolved.
+const NOREPLY_EMAIL_RE = /^\d+\+([\w.-]+)@users\.noreply\.github\.com$/i;
+const COAUTHOR_TRAILER_RE = /^Co-Authored-By:\s*([^<]+?)\s*<\s*([^>]+?)\s*>\s*$/i;
+
+function loginFromNoreplyEmail(email: string): string | null {
+  const m = email.match(NOREPLY_EMAIL_RE);
+  return m ? m[1] : null;
+}
+
+function parseCoAuthorsFromMessage(message: string): Array<{ name: string; email: string }> {
+  if (!message) return [];
+  const out: Array<{ name: string; email: string }> = [];
+  for (const line of message.split(/\r?\n/)) {
+    const m = line.match(COAUTHOR_TRAILER_RE);
+    if (!m) continue;
+    out.push({ name: m[1].trim(), email: m[2].trim() });
+  }
+  return out;
+}
+
+function buildEmailToUserMap(
+  commits: AdjustedCommit[]
+): Map<string, { login: string; avatarUrl: string; htmlUrl: string }> {
+  const map = new Map<string, { login: string; avatarUrl: string; htmlUrl: string }>();
   for (const ac of commits) {
-    const c = ac.node;
-    const author = c.author;
-    if (!author) continue;
-    let key: string;
-    let login: string;
-    let avatarUrl: string;
-    let htmlUrl: string;
+    const author = ac.node.author;
+    if (!author?.user || !author.email) continue;
+    if (!map.has(author.email)) {
+      map.set(author.email, {
+        login: author.user.login,
+        avatarUrl: author.user.avatarUrl,
+        htmlUrl: author.user.url,
+      });
+    }
+  }
+  return map;
+}
+
+function resolveContributors(
+  c: CommitNode,
+  emailToUser: Map<string, { login: string; avatarUrl: string; htmlUrl: string }>
+): Contributor[] {
+  const contributors: Contributor[] = [];
+  const seen = new Set<string>();
+
+  // Primary author.
+  const author = c.author;
+  if (author) {
     if (author.user) {
-      key = author.user.login;
-      login = author.user.login;
-      avatarUrl = author.user.avatarUrl;
-      htmlUrl = author.user.url;
+      const key = author.user.login;
+      if (!seen.has(key)) {
+        seen.add(key);
+        contributors.push({
+          key,
+          login: author.user.login,
+          avatarUrl: author.user.avatarUrl,
+          htmlUrl: author.user.url,
+        });
+      }
     } else if (author.email || author.name) {
       const email = author.email ?? "";
       const name = author.name ?? "anonymous";
-      key = email ? `email:${email}` : `name:${name}`;
-      login = name;
-      avatarUrl = "";
-      htmlUrl = "#";
-    } else {
-      continue;
+      const resolved = email ? emailToUser.get(email) : undefined;
+      const key = resolved
+        ? resolved.login
+        : email
+          ? `email:${email}`
+          : `name:${name}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        contributors.push(
+          resolved
+            ? { key: resolved.login, ...resolved }
+            : { key, login: name, avatarUrl: "", htmlUrl: "#" }
+        );
+      }
     }
-    let racer = byKey.get(key);
-    if (!racer) {
-      racer = {
-        login,
-        avatarUrl,
-        htmlUrl,
-        additions: 0,
-        deletions: 0,
-        commits: 0,
-        commitList: [],
-      };
-      byKey.set(key, racer);
-    }
-    racer.additions += ac.additions;
-    racer.deletions += ac.deletions;
-    racer.commits += 1;
-    racer.commitList!.push({
-      sha: c.oid,
-      repo: repoFullName,
-      message: c.messageHeadline?.slice(0, 200) ?? "",
-      additions: ac.additions,
-      deletions: ac.deletions,
-      committedDate: c.committedDate,
-      htmlUrl: c.url,
-      excludedFiles: ac.excludedFiles || undefined,
-    });
   }
-  return Array.from(byKey.values())
-    .filter((r) => r.commits > 0)
-    .sort((a, b) => b.additions - a.additions);
+
+  // Co-authors from trailers — full credit for each.
+  for (const ca of parseCoAuthorsFromMessage(c.message)) {
+    let resolvedLogin: string | null = null;
+    let resolvedAvatar = "";
+    let resolvedHtml = "#";
+
+    // 1) noreply pattern (most reliable — used by GitHub PR suggestions).
+    const noreplyLogin = loginFromNoreplyEmail(ca.email);
+    if (noreplyLogin) {
+      resolvedLogin = noreplyLogin;
+      resolvedAvatar = `https://github.com/${noreplyLogin}.png?size=64`;
+      resolvedHtml = `https://github.com/${noreplyLogin}`;
+    }
+    // 2) email -> user map built from primary authors in this repo.
+    if (!resolvedLogin) {
+      const found = emailToUser.get(ca.email);
+      if (found) {
+        resolvedLogin = found.login;
+        resolvedAvatar = found.avatarUrl;
+        resolvedHtml = found.htmlUrl;
+      }
+    }
+
+    const key = resolvedLogin ? resolvedLogin : `email:${ca.email}`;
+    if (seen.has(key)) continue; // dedupe (e.g. someone listed as both primary and co-author)
+    seen.add(key);
+
+    contributors.push(
+      resolvedLogin
+        ? { key, login: resolvedLogin, avatarUrl: resolvedAvatar, htmlUrl: resolvedHtml }
+        : { key, login: ca.name, avatarUrl: "", htmlUrl: "#" }
+    );
+  }
+
+  return contributors;
+}
+
+type AggregateResult = {
+  racers: Racer[];
+  realTotalAdditions: number;
+  realTotalDeletions: number;
+  realTotalCommits: number;
+};
+
+function aggregateAdjusted(
+  commits: AdjustedCommit[],
+  repoFullName: string
+): AggregateResult {
+  const byKey = new Map<string, Racer>();
+  const emailToUser = buildEmailToUserMap(commits);
+  let realTotalAdditions = 0;
+  let realTotalDeletions = 0;
+  let realTotalCommits = 0;
+
+  for (const ac of commits) {
+    const c = ac.node;
+    const contributors = resolveContributors(c, emailToUser);
+    if (contributors.length === 0) continue;
+
+    realTotalAdditions += ac.additions;
+    realTotalDeletions += ac.deletions;
+    realTotalCommits += 1;
+
+    for (const contrib of contributors) {
+      let racer = byKey.get(contrib.key);
+      if (!racer) {
+        racer = {
+          login: contrib.login,
+          avatarUrl: contrib.avatarUrl,
+          htmlUrl: contrib.htmlUrl,
+          additions: 0,
+          deletions: 0,
+          commits: 0,
+          commitList: [],
+        };
+        byKey.set(contrib.key, racer);
+      }
+      racer.additions += ac.additions;
+      racer.deletions += ac.deletions;
+      racer.commits += 1;
+      racer.commitList!.push({
+        sha: c.oid,
+        repo: repoFullName,
+        message: c.messageHeadline?.slice(0, 200) ?? "",
+        additions: ac.additions,
+        deletions: ac.deletions,
+        committedDate: c.committedDate,
+        htmlUrl: c.url,
+        excludedFiles: ac.excludedFiles || undefined,
+      });
+    }
+  }
+
+  return {
+    racers: Array.from(byKey.values())
+      .filter((r) => r.commits > 0)
+      .sort((a, b) => b.additions - a.additions),
+    realTotalAdditions,
+    realTotalDeletions,
+    realTotalCommits,
+  };
 }
 
 class RepoFetchFailure extends Error {
@@ -341,26 +478,23 @@ async function fetchRepoRaceUncached(
     }
     return adjustCommit(octokit, org, repoName, c);
   });
-  const racers = aggregateAdjusted(adjusted, repoFullName);
-  const totalAdditions = racers.reduce((s, r) => s + r.additions, 0);
-  const totalDeletions = racers.reduce((s, r) => s + r.deletions, 0);
-  const totalCommits = racers.reduce((s, r) => s + r.commits, 0);
-  if (totalCommits === 0) return null;
+  const aggregate = aggregateAdjusted(adjusted, repoFullName);
+  if (aggregate.realTotalCommits === 0) return null;
   return {
     name: repoName,
     fullName: repoFullName,
     htmlUrl,
     private: isPrivate,
-    totalAdditions,
-    totalDeletions,
-    totalCommits,
-    racers,
+    totalAdditions: aggregate.realTotalAdditions,
+    totalDeletions: aggregate.realTotalDeletions,
+    totalCommits: aggregate.realTotalCommits,
+    racers: aggregate.racers,
   };
 }
 
 const cachedFetchRepoRace = unstable_cache(
   fetchRepoRaceUncached,
-  ["repo-race-graphql-v2"],
+  ["repo-race-graphql-v3-coauthors"],
   { revalidate: 60 * 60, tags: ["github-code-race"] }
 );
 
@@ -506,9 +640,12 @@ export async function getOrgRaceData(opts: {
     }
   }
   const orgRacers = Array.from(orgRacerMap.values()).sort((a, b) => b.additions - a.additions);
-  const totalAdditions = orgRacers.reduce((s, r) => s + r.additions, 0);
-  const totalDeletions = orgRacers.reduce((s, r) => s + r.deletions, 0);
-  const totalCommits = orgRacers.reduce((s, r) => s + r.commits, 0);
+  // Real org totals = sum of each repo's real totals (NOT sum of racer counts —
+  // co-authoring credits multiple racers for the same commit, which would
+  // overcount lines/commits at the org level).
+  const totalAdditions = repoRaces.reduce((s, r) => s + r.totalAdditions, 0);
+  const totalDeletions = repoRaces.reduce((s, r) => s + r.totalDeletions, 0);
+  const totalCommits = repoRaces.reduce((s, r) => s + r.totalCommits, 0);
 
   return {
     org,
