@@ -1,12 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import OrgForm, { type Period } from "@/components/OrgForm";
+import { format, startOfMonth, endOfMonth } from "date-fns";
+import OrgForm from "@/components/OrgForm";
+import { type DateRangeValue } from "@/components/DateRangePicker";
 import RaceTrack from "@/components/RaceTrack";
 import RepoBreakdown from "@/components/RepoBreakdown";
 import Scoreboard from "@/components/Scoreboard";
 import Warnings from "@/components/Warnings";
-import { loadSavedOrg, loadSavedPeriodKind, savePeriodKind } from "@/lib/storage";
+import { loadSavedOrg } from "@/lib/storage";
 import type { RaceData } from "@/lib/types";
 
 function fmtNum(n: number) {
@@ -16,12 +18,11 @@ function fmtNum(n: number) {
 function formatRange(sinceISO: string, untilISO: string): string {
   const s = new Date(sinceISO);
   const u = new Date(untilISO);
-  // Recognise a calendar-month range: starts on the 1st, ends on the 1st of
-  // the next month.
   const isMonth =
     s.getUTCDate() === 1 &&
     u.getUTCDate() === 1 &&
-    ((s.getUTCMonth() + 1) % 12 === u.getUTCMonth() || (s.getUTCMonth() === 11 && u.getUTCMonth() === 0));
+    ((s.getUTCMonth() + 1) % 12 === u.getUTCMonth() ||
+      (s.getUTCMonth() === 11 && u.getUTCMonth() === 0));
   if (isMonth) {
     return s.toLocaleDateString("en-US", {
       month: "long",
@@ -44,88 +45,80 @@ function formatRange(sinceISO: string, untilISO: string): string {
   return `${startStr} — ${endStr}`;
 }
 
+function rangeToParams(range: DateRangeValue): URLSearchParams {
+  const params = new URLSearchParams();
+  params.set("since", format(range.from, "yyyy-MM-dd"));
+  params.set("until", format(range.to, "yyyy-MM-dd"));
+  return params;
+}
+
 export default function Home() {
   const [data, setData] = useState<RaceData | null>(null);
   const [loading, setLoading] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedOrg, setSavedOrg] = useState<string | null>(null);
-  const [savedPeriod, setSavedPeriod] = useState<Period | null>(null);
-  const [lastQuery, setLastQuery] = useState<{ org: string; period: Period } | null>(null);
+  const [lastQuery, setLastQuery] = useState<{ org: string; range: DateRangeValue } | null>(null);
 
-  const startRace = useCallback(async (org: string, period: Period, mode: "full" | "retry" = "full") => {
-    if (mode === "retry") {
-      setRetrying(true);
-    } else {
-      setLoading(true);
-      setData(null);
-    }
-    setError(null);
-    setLastQuery({ org, period });
-    savePeriodKind(period.kind);
-    try {
-      const params = new URLSearchParams({ org });
-      params.set(period.kind, period.value);
-      const res = await fetch(`/api/race?${params.toString()}`);
-      const text = await res.text();
-      let json: RaceData | { error?: string } | null = null;
+  const startRace = useCallback(
+    async (org: string, range: DateRangeValue, mode: "full" | "retry" = "full") => {
+      if (mode === "retry") {
+        setRetrying(true);
+      } else {
+        setLoading(true);
+        setData(null);
+      }
+      setError(null);
+      setLastQuery({ org, range });
       try {
-        json = text ? (JSON.parse(text) as RaceData | { error?: string }) : null;
-      } catch {
-        // Non-JSON body — usually a Vercel platform error (timeout, gateway).
+        const params = rangeToParams(range);
+        params.set("org", org);
+        const res = await fetch(`/api/race?${params.toString()}`);
+        const text = await res.text();
+        let json: RaceData | { error?: string } | null = null;
+        try {
+          json = text ? (JSON.parse(text) as RaceData | { error?: string }) : null;
+        } catch {
+          // Non-JSON body — usually a Vercel platform error (timeout, gateway).
+        }
+        if (!res.ok) {
+          const fromJson = json && "error" in json ? json.error : undefined;
+          const snippet = text ? text.slice(0, 180) : `HTTP ${res.status}`;
+          throw new Error(fromJson || snippet);
+        }
+        if (!json) {
+          throw new Error(
+            `The server returned a non-JSON response (${res.status}) — likely a Vercel function timeout. Hit START again; repos that just finished computing on GitHub will be cached now.`
+          );
+        }
+        setData(json as RaceData);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Unknown error");
+      } finally {
+        setLoading(false);
+        setRetrying(false);
       }
-      if (!res.ok) {
-        const fromJson = json && "error" in json ? json.error : undefined;
-        const snippet = text ? text.slice(0, 180) : `HTTP ${res.status}`;
-        throw new Error(fromJson || snippet);
-      }
-      if (!json) {
-        throw new Error(
-          `The server returned a non-JSON response (${res.status}) — likely a Vercel function timeout. Hit START again; repos that just finished computing on GitHub will be cached now.`
-        );
-      }
-      setData(json as RaceData);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
-    } finally {
-      setLoading(false);
-      setRetrying(false);
-    }
-  }, []);
+    },
+    []
+  );
 
   const retrySkippedRepos = useCallback(() => {
     if (!lastQuery) return;
-    void startRace(lastQuery.org, lastQuery.period, "retry");
+    void startRace(lastQuery.org, lastQuery.range, "retry");
   }, [lastQuery, startRace]);
 
-  // On first mount: hydrate the saved org + period from localStorage and
-  // auto-start the race. The server cache means this is essentially free if
-  // anyone has run the same org+period within the last hour.
+  // On first mount: hydrate the saved org from localStorage and auto-start
+  // the race for the current month.
   useEffect(() => {
     const org = loadSavedOrg();
     if (!org) return;
     setSavedOrg(org);
-    const kind = loadSavedPeriodKind() ?? "month";
     const now = new Date();
-    let period: Period;
-    if (kind === "week") {
-      // Compute current ISO week for auto-start.
-      const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-      const dayNum = (target.getUTCDay() + 6) % 7;
-      target.setUTCDate(target.getUTCDate() - dayNum + 3);
-      const firstThursday = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
-      const firstDayNum = (firstThursday.getUTCDay() + 6) % 7;
-      firstThursday.setUTCDate(firstThursday.getUTCDate() - firstDayNum + 3);
-      const weekNum =
-        Math.round((target.getTime() - firstThursday.getTime()) / (7 * 24 * 60 * 60 * 1000)) + 1;
-      const value = `${target.getUTCFullYear()}-W${String(weekNum).padStart(2, "0")}`;
-      period = { kind: "week", value };
-    } else {
-      const value = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
-      period = { kind: "month", value };
-    }
-    setSavedPeriod(period);
-    startRace(org, period);
+    const range: DateRangeValue = {
+      from: startOfMonth(now),
+      to: endOfMonth(now),
+    };
+    void startRace(org, range);
   }, [startRace]);
 
   const periodLabel = data ? formatRange(data.since, data.until) : "";
@@ -141,12 +134,7 @@ export default function Home() {
         </p>
       </header>
 
-      <OrgForm
-        onStart={(org, period) => startRace(org, period)}
-        loading={loading}
-        initialOrg={savedOrg}
-        initialPeriod={savedPeriod}
-      />
+      <OrgForm onStart={startRace} loading={loading} initialOrg={savedOrg} />
 
       {error && (
         <div className="mt-6 rounded-lg border border-red-500 bg-red-950/40 p-4 text-red-200">

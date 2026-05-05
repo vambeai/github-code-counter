@@ -36,6 +36,21 @@ body {
   animation: flag-wave 1s ease-in-out infinite;
 }
 
+/* react-day-picker dark-theme overrides — keep base layout, override colors */
+.rdp {
+  --rdp-cell-size: 32px;
+  --rdp-accent-color: #fde047; /* yellow-300 */
+  --rdp-background-color: rgba(253, 224, 71, 0.15);
+  --rdp-accent-color-dark: #fde047;
+  --rdp-background-color-dark: rgba(253, 224, 71, 0.18);
+  --rdp-outline: 2px solid #fde047;
+  --rdp-outline-selected: 2px solid #fde047;
+  margin: 0;
+}
+.rdp-month {
+  background-color: transparent;
+}
+
 @keyframes track-stripes {
   to {
     background-position: -40px 0;

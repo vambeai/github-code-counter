@@ -6,6 +6,7 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 const ORG_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const ISO_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 function parseOrg(input: string): string | null {
   let value = input.trim();
@@ -17,11 +18,27 @@ function parseOrg(input: string): string | null {
   return value;
 }
 
-// ISO 8601 week parsing: "2026-W19" -> Monday of week 19 of 2026.
+function parseISODate(input: string): Date | null {
+  const m = input.match(ISO_DATE_PATTERN);
+  if (!m) return null;
+  const year = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  const day = parseInt(m[3], 10);
+  const d = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
+  if (
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() !== month - 1 ||
+    d.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return d;
+}
+
+// Legacy: ISO 8601 week parsing — kept for backwards compat with old links.
 function isoWeekMonday(year: number, week: number): Date {
-  // Per ISO 8601: Jan 4 is always in week 1; weeks start Monday.
   const jan4 = new Date(Date.UTC(year, 0, 4));
-  const jan4Day = jan4.getUTCDay() || 7; // Sun=0 -> 7
+  const jan4Day = jan4.getUTCDay() || 7;
   const week1Mon = new Date(jan4);
   week1Mon.setUTCDate(jan4.getUTCDate() - (jan4Day - 1));
   const target = new Date(week1Mon);
@@ -40,6 +57,8 @@ export async function GET(req: NextRequest) {
 
   const url = new URL(req.url);
   const orgInput = url.searchParams.get("org") ?? "";
+  const sinceParam = url.searchParams.get("since");
+  const untilParam = url.searchParams.get("until");
   const monthParam = url.searchParams.get("month");
   const weekParam = url.searchParams.get("week");
 
@@ -54,11 +73,30 @@ export async function GET(req: NextRequest) {
   let since: Date;
   let until: Date;
 
-  if (weekParam) {
+  if (sinceParam && untilParam) {
+    const s = parseISODate(sinceParam);
+    const u = parseISODate(untilParam);
+    if (!s || !u) {
+      return NextResponse.json(
+        { error: "Invalid since/until. Use YYYY-MM-DD." },
+        { status: 400 }
+      );
+    }
+    if (u < s) {
+      return NextResponse.json(
+        { error: "until must be on or after since." },
+        { status: 400 }
+      );
+    }
+    since = s;
+    // until is INCLUSIVE in the URL (the day the user sees in the picker), so
+    // bump by 1 day for the exclusive-end internal model.
+    until = new Date(u.getTime() + 24 * 60 * 60 * 1000);
+  } else if (weekParam) {
     const m = weekParam.match(/^(\d{4})-W(\d{2})$/);
     if (!m) {
       return NextResponse.json(
-        { error: "Invalid week. Use ISO 8601 format YYYY-Www (e.g. 2026-W19)." },
+        { error: "Invalid week. Use ISO 8601 format YYYY-Www." },
         { status: 400 }
       );
     }
