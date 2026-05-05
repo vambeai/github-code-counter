@@ -1,16 +1,27 @@
 import { Octokit } from "@octokit/rest";
 import { unstable_cache } from "next/cache";
-import type { Racer, RaceData, RepoRace, Warning } from "./types";
+import type { CommitInfo, Racer, RaceData, RepoRace, Warning } from "./types";
 
-// Per-repo deadline covers up to ~20 pages of 100 commits via GraphQL. For
-// typical org repos that's well over a month's worth of commits.
-const PER_REPO_DEADLINE_MS = 12_000;
+// Per-repo deadline covers up to ~20 pages of 100 commits via GraphQL plus
+// a handful of REST per-commit detail calls for big commits. For typical org
+// repos that's well over a month's worth of commits.
+const PER_REPO_DEADLINE_MS = 18_000;
 const ORG_DEADLINE_MS = 50_000;
 const MAIN_CONCURRENCY = 6;
 const MAX_PAGES_PER_REPO = 20;
+// Per-file (NOT per-commit) threshold. Any single file in a commit whose
+// additions OR deletions exceed this is excluded — lockfiles, generated
+// code, vendored deps, large data dumps, etc. The rest of the commit's
+// files still count.
+const FILE_LINE_THRESHOLD = 10_000;
+const COMMIT_DETAIL_CONCURRENCY = 4;
+// Cap the per-author commit list we ship to the client.
+const MAX_COMMITS_PER_AUTHOR = 200;
 
 type CommitNode = {
   oid: string;
+  messageHeadline: string;
+  url: string;
   additions: number;
   deletions: number;
   committedDate: string;
@@ -55,6 +66,8 @@ const COMMIT_HISTORY_QUERY = /* GraphQL */ `
               }
               nodes {
                 oid
+                messageHeadline
+                url
                 additions
                 deletions
                 committedDate
@@ -168,9 +181,70 @@ function buildWarning(
   };
 }
 
-function aggregateCommits(commits: CommitNode[]): Racer[] {
+type AdjustedCommit = {
+  node: CommitNode;
+  additions: number;
+  deletions: number;
+  excludedFiles: number;
+};
+
+async function fetchCommitFiles(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  sha: string
+): Promise<Array<{ filename: string; additions: number; deletions: number }> | null> {
+  try {
+    const res = await octokit.request("GET /repos/{owner}/{repo}/commits/{ref}", {
+      owner,
+      repo,
+      ref: sha,
+    });
+    const data = res.data as {
+      files?: Array<{ filename: string; additions: number; deletions: number }>;
+    };
+    return data.files ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function adjustCommit(
+  octokit: Octokit,
+  org: string,
+  repoName: string,
+  c: CommitNode
+): Promise<AdjustedCommit> {
+  // Fast path: if the commit's TOTAL additions/deletions are below the threshold,
+  // no single file can exceed it either — accept the GraphQL totals as-is.
+  if (c.additions <= FILE_LINE_THRESHOLD && c.deletions <= FILE_LINE_THRESHOLD) {
+    return { node: c, additions: c.additions, deletions: c.deletions, excludedFiles: 0 };
+  }
+  const files = await fetchCommitFiles(octokit, org, repoName, c.oid);
+  if (!files) {
+    // REST detail unavailable (rate limit, error). Conservatively keep the totals.
+    return { node: c, additions: c.additions, deletions: c.deletions, excludedFiles: 0 };
+  }
+  let additions = 0;
+  let deletions = 0;
+  let excluded = 0;
+  for (const f of files) {
+    const a = f.additions ?? 0;
+    const d = f.deletions ?? 0;
+    if (a > FILE_LINE_THRESHOLD || d > FILE_LINE_THRESHOLD) {
+      excluded += 1;
+      continue;
+    }
+    additions += a;
+    deletions += d;
+  }
+  return { node: c, additions, deletions, excludedFiles: excluded };
+}
+
+function aggregateAdjusted(commits: AdjustedCommit[], repoFullName: string): Racer[] {
   const byKey = new Map<string, Racer>();
-  for (const c of commits) {
+  for (const ac of commits) {
+    const c = ac.node;
     const author = c.author;
     if (!author) continue;
     let key: string;
@@ -194,12 +268,30 @@ function aggregateCommits(commits: CommitNode[]): Racer[] {
     }
     let racer = byKey.get(key);
     if (!racer) {
-      racer = { login, avatarUrl, htmlUrl, additions: 0, deletions: 0, commits: 0 };
+      racer = {
+        login,
+        avatarUrl,
+        htmlUrl,
+        additions: 0,
+        deletions: 0,
+        commits: 0,
+        commitList: [],
+      };
       byKey.set(key, racer);
     }
-    racer.additions += c.additions;
-    racer.deletions += c.deletions;
+    racer.additions += ac.additions;
+    racer.deletions += ac.deletions;
     racer.commits += 1;
+    racer.commitList!.push({
+      sha: c.oid,
+      repo: repoFullName,
+      message: c.messageHeadline?.slice(0, 200) ?? "",
+      additions: ac.additions,
+      deletions: ac.deletions,
+      committedDate: c.committedDate,
+      htmlUrl: c.url,
+      excludedFiles: ac.excludedFiles || undefined,
+    });
   }
   return Array.from(byKey.values())
     .filter((r) => r.commits > 0)
@@ -233,14 +325,30 @@ async function fetchRepoRaceUncached(
   if (outcome.kind !== "ok") {
     throw new RepoFetchFailure(`${org}/${repoName}`, outcome);
   }
-  const racers = aggregateCommits(outcome.commits);
+  const repoFullName = `${org}/${repoName}`;
+  // For each commit, decide whether we need to fetch the per-file diff (only
+  // if total adds/dels could contain a file > FILE_LINE_THRESHOLD). REST calls
+  // run with their own concurrency limiter so we don't blow the deadline.
+  const adjusted = await withConcurrency(outcome.commits, COMMIT_DETAIL_CONCURRENCY, async (c) => {
+    if (Date.now() >= deadlineMs) {
+      // Out of time — fall back to GraphQL totals.
+      return {
+        node: c,
+        additions: c.additions,
+        deletions: c.deletions,
+        excludedFiles: 0,
+      } satisfies AdjustedCommit;
+    }
+    return adjustCommit(octokit, org, repoName, c);
+  });
+  const racers = aggregateAdjusted(adjusted, repoFullName);
   const totalAdditions = racers.reduce((s, r) => s + r.additions, 0);
   const totalDeletions = racers.reduce((s, r) => s + r.deletions, 0);
   const totalCommits = racers.reduce((s, r) => s + r.commits, 0);
   if (totalCommits === 0) return null;
   return {
     name: repoName,
-    fullName: `${org}/${repoName}`,
+    fullName: repoFullName,
     htmlUrl,
     private: isPrivate,
     totalAdditions,
@@ -252,7 +360,7 @@ async function fetchRepoRaceUncached(
 
 const cachedFetchRepoRace = unstable_cache(
   fetchRepoRaceUncached,
-  ["repo-race-graphql-v1"],
+  ["repo-race-graphql-v2"],
   { revalidate: 60 * 60, tags: ["github-code-race"] }
 );
 
@@ -377,9 +485,24 @@ export async function getOrgRaceData(opts: {
         existing.additions += r.additions;
         existing.deletions += r.deletions;
         existing.commits += r.commits;
+        if (r.commitList && r.commitList.length > 0) {
+          if (!existing.commitList) existing.commitList = [];
+          existing.commitList.push(...r.commitList);
+        }
       } else {
-        orgRacerMap.set(r.login, { ...r });
+        orgRacerMap.set(r.login, {
+          ...r,
+          commitList: r.commitList ? [...r.commitList] : undefined,
+        });
       }
+    }
+  }
+  // Sort each racer's commit list by additions desc and cap to MAX_COMMITS_PER_AUTHOR.
+  for (const racer of orgRacerMap.values()) {
+    if (!racer.commitList) continue;
+    racer.commitList.sort((a, b) => b.additions - a.additions);
+    if (racer.commitList.length > MAX_COMMITS_PER_AUTHOR) {
+      racer.commitList = racer.commitList.slice(0, MAX_COMMITS_PER_AUTHOR);
     }
   }
   const orgRacers = Array.from(orgRacerMap.values()).sort((a, b) => b.additions - a.additions);

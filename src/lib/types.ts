@@ -1,3 +1,14 @@
+export type CommitInfo = {
+  sha: string;
+  repo: string;
+  message: string;
+  additions: number;
+  deletions: number;
+  committedDate: string;
+  htmlUrl: string;
+  excludedFiles?: number;
+};
+
 export type Racer = {
   login: string;
   avatarUrl: string;
@@ -5,6 +16,7 @@ export type Racer = {
   additions: number;
   deletions: number;
   commits: number;
+  commitList?: CommitInfo[];
 };
 
 export type RepoRace = {
