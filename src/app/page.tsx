@@ -1,16 +1,47 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import OrgForm from "@/components/OrgForm";
+import OrgForm, { type Period } from "@/components/OrgForm";
 import RaceTrack from "@/components/RaceTrack";
 import RepoBreakdown from "@/components/RepoBreakdown";
 import Scoreboard from "@/components/Scoreboard";
 import Warnings from "@/components/Warnings";
-import { loadSavedOrg } from "@/lib/storage";
+import { loadSavedOrg, loadSavedPeriodKind, savePeriodKind } from "@/lib/storage";
 import type { RaceData } from "@/lib/types";
 
 function fmtNum(n: number) {
   return n.toLocaleString("en-US");
+}
+
+function formatRange(sinceISO: string, untilISO: string): string {
+  const s = new Date(sinceISO);
+  const u = new Date(untilISO);
+  // Recognise a calendar-month range: starts on the 1st, ends on the 1st of
+  // the next month.
+  const isMonth =
+    s.getUTCDate() === 1 &&
+    u.getUTCDate() === 1 &&
+    ((s.getUTCMonth() + 1) % 12 === u.getUTCMonth() || (s.getUTCMonth() === 11 && u.getUTCMonth() === 0));
+  if (isMonth) {
+    return s.toLocaleDateString("en-US", {
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC",
+    });
+  }
+  const lastDay = new Date(u.getTime() - 24 * 60 * 60 * 1000);
+  const startStr = s.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+  const endStr = lastDay.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: lastDay.getUTCFullYear() !== s.getUTCFullYear() ? "numeric" : undefined,
+    timeZone: "UTC",
+  });
+  return `${startStr} — ${endStr}`;
 }
 
 export default function Home() {
@@ -19,9 +50,10 @@ export default function Home() {
   const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedOrg, setSavedOrg] = useState<string | null>(null);
-  const [lastQuery, setLastQuery] = useState<{ org: string; month: string } | null>(null);
+  const [savedPeriod, setSavedPeriod] = useState<Period | null>(null);
+  const [lastQuery, setLastQuery] = useState<{ org: string; period: Period } | null>(null);
 
-  const startRace = useCallback(async (org: string, month: string, mode: "full" | "retry" = "full") => {
+  const startRace = useCallback(async (org: string, period: Period, mode: "full" | "retry" = "full") => {
     if (mode === "retry") {
       setRetrying(true);
     } else {
@@ -29,10 +61,11 @@ export default function Home() {
       setData(null);
     }
     setError(null);
-    setLastQuery({ org, month });
+    setLastQuery({ org, period });
+    savePeriodKind(period.kind);
     try {
       const params = new URLSearchParams({ org });
-      if (month) params.set("month", month);
+      params.set(period.kind, period.value);
       const res = await fetch(`/api/race?${params.toString()}`);
       const text = await res.text();
       let json: RaceData | { error?: string } | null = null;
@@ -62,28 +95,40 @@ export default function Home() {
 
   const retrySkippedRepos = useCallback(() => {
     if (!lastQuery) return;
-    void startRace(lastQuery.org, lastQuery.month, "retry");
+    void startRace(lastQuery.org, lastQuery.period, "retry");
   }, [lastQuery, startRace]);
 
-  // On first mount: hydrate the saved org from localStorage and auto-start
-  // the race. The server cache means this is essentially free if anyone has
-  // run the same org+month within the last hour.
+  // On first mount: hydrate the saved org + period from localStorage and
+  // auto-start the race. The server cache means this is essentially free if
+  // anyone has run the same org+period within the last hour.
   useEffect(() => {
     const org = loadSavedOrg();
     if (!org) return;
     setSavedOrg(org);
+    const kind = loadSavedPeriodKind() ?? "month";
     const now = new Date();
-    const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
-    startRace(org, month);
+    let period: Period;
+    if (kind === "week") {
+      // Compute current ISO week for auto-start.
+      const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+      const dayNum = (target.getUTCDay() + 6) % 7;
+      target.setUTCDate(target.getUTCDate() - dayNum + 3);
+      const firstThursday = new Date(Date.UTC(target.getUTCFullYear(), 0, 4));
+      const firstDayNum = (firstThursday.getUTCDay() + 6) % 7;
+      firstThursday.setUTCDate(firstThursday.getUTCDate() - firstDayNum + 3);
+      const weekNum =
+        Math.round((target.getTime() - firstThursday.getTime()) / (7 * 24 * 60 * 60 * 1000)) + 1;
+      const value = `${target.getUTCFullYear()}-W${String(weekNum).padStart(2, "0")}`;
+      period = { kind: "week", value };
+    } else {
+      const value = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+      period = { kind: "month", value };
+    }
+    setSavedPeriod(period);
+    startRace(org, period);
   }, [startRace]);
 
-  const monthLabel = data
-    ? new Date(data.since).toLocaleDateString("en-US", {
-        month: "long",
-        year: "numeric",
-        timeZone: "UTC",
-      })
-    : "";
+  const periodLabel = data ? formatRange(data.since, data.until) : "";
 
   return (
     <main className="container mx-auto px-4 py-8 max-w-6xl">
@@ -96,7 +141,12 @@ export default function Home() {
         </p>
       </header>
 
-      <OrgForm onStart={startRace} loading={loading} initialOrg={savedOrg} />
+      <OrgForm
+        onStart={(org, period) => startRace(org, period)}
+        loading={loading}
+        initialOrg={savedOrg}
+        initialPeriod={savedPeriod}
+      />
 
       {error && (
         <div className="mt-6 rounded-lg border border-red-500 bg-red-950/40 p-4 text-red-200">
@@ -110,7 +160,7 @@ export default function Home() {
       {data && (
         <>
           <RaceTrack
-            title={`${data.org}/*  ·  ${monthLabel}`}
+            title={`${data.org}/*  ·  ${periodLabel}`}
             subtitle={
               <>
                 <span className="text-emerald-400">+{fmtNum(data.totalAdditions)}</span>{"  "}

@@ -3,19 +3,19 @@ import { unstable_cache } from "next/cache";
 import type { CommitInfo, Racer, RaceData, RepoRace, Warning } from "./types";
 
 // Budget tuning for Vercel's 60s maxDuration:
-//  * Concurrency 11 lets a 21-repo org (e.g. vambeai) finish in 2 parallel
-//    rounds.
-//  * 25s per repo covers GraphQL pagination + per-commit REST detail calls
-//    for the 10k file-line-threshold filter, even on heavy repos with many
-//    big commits.
-//  * 54s org deadline means 2 * 25s rounds + ~2s for repo listing all fit
-//    comfortably under maxDuration with margin.
-//  * If a single repo's deadline hits mid-pagination, we now KEEP the
-//    commits gathered so far (truncated=true) instead of throwing them away.
-const PER_REPO_DEADLINE_MS = 25_000;
-const ORG_DEADLINE_MS = 54_000;
-const MAIN_CONCURRENCY = 11;
-const MAX_PAGES_PER_REPO = 20;
+//  * For month mode we now slice a repo's request into ~5 parallel weekly
+//    GraphQL queries (see fetchCommitHistoryWindowed). That collapses the
+//    per-repo wall clock from "8 sequential pages" to "max(weeks) ≈ 1-2
+//    pages", making 12s per repo a comfortable budget for huge orgs.
+//  * Concurrency 8 + per-repo 12s + listing ~2s = 21 repos in 3 rounds = ~38s.
+//  * Org deadline 50s leaves safe margin under maxDuration.
+//  * Partial pagination data is preserved (truncated=true) instead of thrown
+//    away if any single window's deadline still hits.
+const PER_REPO_DEADLINE_MS = 12_000;
+const ORG_DEADLINE_MS = 50_000;
+const MAIN_CONCURRENCY = 8;
+const MAX_PAGES_PER_REPO = 10;
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 // Per-file (NOT per-commit) threshold. Any single file in a commit whose
 // additions OR deletions exceed this is excluded — lockfiles, generated
 // code, vendored deps, large data dumps, etc. The rest of the commit's
@@ -165,6 +165,87 @@ async function fetchCommitHistory(
     }
   }
   return { kind: "ok", commits: all, pages, truncated: true };
+}
+
+function computeWeekWindows(
+  since: Date,
+  until: Date
+): Array<{ since: Date; until: Date }> {
+  const windows: Array<{ since: Date; until: Date }> = [];
+  let cursorMs = since.getTime();
+  const untilMs = until.getTime();
+  while (cursorMs < untilMs) {
+    const endMs = Math.min(cursorMs + WEEK_MS, untilMs);
+    windows.push({ since: new Date(cursorMs), until: new Date(endMs) });
+    cursorMs = endMs;
+  }
+  // Edge case: if range is < 1 day, ensure at least one window.
+  if (windows.length === 0) windows.push({ since, until });
+  return windows;
+}
+
+// Fan out per-repo fetches into parallel weekly windows. For a 30-day month
+// that's ~5 weeks running in parallel via Promise.all; each window paginates
+// independently. Merges and dedupes by commit oid. Even with one heavy repo,
+// the wall clock is bounded by the busiest single week, not the whole month.
+async function fetchCommitHistoryWindowed(
+  octokit: Octokit,
+  owner: string,
+  name: string,
+  sinceISO: string,
+  untilISO: string,
+  deadlineMs: number
+): Promise<FetchOutcome> {
+  const windows = computeWeekWindows(new Date(sinceISO), new Date(untilISO));
+  if (windows.length <= 1) {
+    return fetchCommitHistory(octokit, owner, name, sinceISO, untilISO, deadlineMs);
+  }
+  const results = await Promise.all(
+    windows.map((w) =>
+      fetchCommitHistory(
+        octokit,
+        owner,
+        name,
+        w.since.toISOString(),
+        w.until.toISOString(),
+        deadlineMs
+      )
+    )
+  );
+
+  let totalPages = 0;
+  let anyTruncated = false;
+  let firstError: Extract<FetchOutcome, { kind: "error" }> | null = null;
+  const allCommits: CommitNode[] = [];
+
+  for (const r of results) {
+    totalPages += r.pages;
+    if (r.kind === "ok") {
+      allCommits.push(...r.commits);
+      if (r.truncated) anyTruncated = true;
+    } else if (r.kind === "deadline") {
+      allCommits.push(...r.partial);
+      anyTruncated = true;
+    } else if (!firstError) {
+      firstError = r;
+    }
+  }
+
+  // If every window failed and we got nothing, propagate the error.
+  if (allCommits.length === 0 && firstError) return firstError;
+
+  // Defensive: dedupe by oid in case windows overlap on boundaries.
+  const seen = new Set<string>();
+  const unique = allCommits.filter((c) => {
+    if (seen.has(c.oid)) return false;
+    seen.add(c.oid);
+    return true;
+  });
+
+  if (anyTruncated) {
+    return { kind: "deadline", pages: totalPages, partial: unique };
+  }
+  return { kind: "ok", commits: unique, pages: totalPages, truncated: false };
 }
 
 function buildWarning(
@@ -465,7 +546,14 @@ async function fetchRepoRaceUncached(
   if (!token) throw new Error("Server is missing the GITHUB_TOKEN environment variable.");
   const octokit = new Octokit({ auth: token });
   const deadlineMs = Date.now() + PER_REPO_DEADLINE_MS;
-  const outcome = await fetchCommitHistory(octokit, org, repoName, sinceISO, untilISO, deadlineMs);
+  const outcome = await fetchCommitHistoryWindowed(
+    octokit,
+    org,
+    repoName,
+    sinceISO,
+    untilISO,
+    deadlineMs
+  );
   const repoFullName = `${org}/${repoName}`;
 
   // Decide which commits we have to work with. On a hard error (auth, 404,
@@ -520,7 +608,7 @@ async function fetchRepoRaceUncached(
 
 const cachedFetchRepoRace = unstable_cache(
   fetchRepoRaceUncached,
-  ["repo-race-graphql-v4-partial"],
+  ["repo-race-graphql-v5-windowed"],
   { revalidate: 60 * 60, tags: ["github-code-race"] }
 );
 

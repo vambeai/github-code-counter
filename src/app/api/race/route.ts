@@ -17,6 +17,18 @@ function parseOrg(input: string): string | null {
   return value;
 }
 
+// ISO 8601 week parsing: "2026-W19" -> Monday of week 19 of 2026.
+function isoWeekMonday(year: number, week: number): Date {
+  // Per ISO 8601: Jan 4 is always in week 1; weeks start Monday.
+  const jan4 = new Date(Date.UTC(year, 0, 4));
+  const jan4Day = jan4.getUTCDay() || 7; // Sun=0 -> 7
+  const week1Mon = new Date(jan4);
+  week1Mon.setUTCDate(jan4.getUTCDate() - (jan4Day - 1));
+  const target = new Date(week1Mon);
+  target.setUTCDate(week1Mon.getUTCDate() + (week - 1) * 7);
+  return target;
+}
+
 export async function GET(req: NextRequest) {
   const token = process.env.GITHUB_TOKEN;
   if (!token) {
@@ -29,6 +41,7 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const orgInput = url.searchParams.get("org") ?? "";
   const monthParam = url.searchParams.get("month");
+  const weekParam = url.searchParams.get("week");
 
   const org = parseOrg(orgInput);
   if (!org) {
@@ -38,19 +51,39 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const now = new Date();
-  let year = now.getUTCFullYear();
-  let month = now.getUTCMonth();
-  if (monthParam) {
-    const m = monthParam.match(/^(\d{4})-(\d{2})$/);
+  let since: Date;
+  let until: Date;
+
+  if (weekParam) {
+    const m = weekParam.match(/^(\d{4})-W(\d{2})$/);
     if (!m) {
-      return NextResponse.json({ error: "Invalid month. Use YYYY-MM." }, { status: 400 });
+      return NextResponse.json(
+        { error: "Invalid week. Use ISO 8601 format YYYY-Www (e.g. 2026-W19)." },
+        { status: 400 }
+      );
     }
-    year = parseInt(m[1], 10);
-    month = parseInt(m[2], 10) - 1;
+    const year = parseInt(m[1], 10);
+    const week = parseInt(m[2], 10);
+    if (week < 1 || week > 53) {
+      return NextResponse.json({ error: "Week number must be 1-53." }, { status: 400 });
+    }
+    since = isoWeekMonday(year, week);
+    until = new Date(since.getTime() + 7 * 24 * 60 * 60 * 1000);
+  } else {
+    const now = new Date();
+    let year = now.getUTCFullYear();
+    let month = now.getUTCMonth();
+    if (monthParam) {
+      const m = monthParam.match(/^(\d{4})-(\d{2})$/);
+      if (!m) {
+        return NextResponse.json({ error: "Invalid month. Use YYYY-MM." }, { status: 400 });
+      }
+      year = parseInt(m[1], 10);
+      month = parseInt(m[2], 10) - 1;
+    }
+    since = new Date(Date.UTC(year, month, 1, 0, 0, 0));
+    until = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0));
   }
-  const since = new Date(Date.UTC(year, month, 1, 0, 0, 0));
-  const until = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0));
 
   try {
     const data = await getCachedOrgRaceData(org, since, until);
