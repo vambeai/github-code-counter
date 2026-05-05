@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { format, startOfMonth, endOfMonth } from "date-fns";
+import { format, startOfWeek, endOfWeek } from "date-fns";
 import OrgForm from "@/components/OrgForm";
 import { type DateRangeValue } from "@/components/DateRangePicker";
 import RaceTrack from "@/components/RaceTrack";
@@ -108,15 +108,15 @@ export default function Home() {
   }, [lastQuery, startRace]);
 
   // On first mount: hydrate the saved org from localStorage and auto-start
-  // the race for the current month.
+  // the race for the current week (Mon-Sun).
   useEffect(() => {
     const org = loadSavedOrg();
     if (!org) return;
     setSavedOrg(org);
     const now = new Date();
     const range: DateRangeValue = {
-      from: startOfMonth(now),
-      to: endOfMonth(now),
+      from: startOfWeek(now, { weekStartsOn: 1 }),
+      to: endOfWeek(now, { weekStartsOn: 1 }),
     };
     void startRace(org, range);
   }, [startRace]);
@@ -130,7 +130,7 @@ export default function Home() {
           🏁 GITHUB CODE RACE 🏁
         </h1>
         <p className="mt-3 text-zinc-300 text-base md:text-lg">
-          Who shipped the most lines this month? Place your bets, devs.
+          Who shipped the most lines this week? Place your bets, devs.
         </p>
       </header>
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { startOfMonth, endOfMonth } from "date-fns";
+import { startOfWeek, endOfWeek } from "date-fns";
 import DateRangePicker, { type DateRangeValue } from "./DateRangePicker";
 import { saveOrg } from "@/lib/storage";
 
@@ -22,7 +22,10 @@ export default function OrgForm({
   const [range, setRange] = useState<DateRangeValue | null>(() => {
     if (initialRange) return initialRange;
     const now = new Date();
-    return { from: startOfMonth(now), to: endOfMonth(now) };
+    return {
+      from: startOfWeek(now, { weekStartsOn: 1 }),
+      to: endOfWeek(now, { weekStartsOn: 1 }),
+    };
   });
 
   useEffect(() => {
