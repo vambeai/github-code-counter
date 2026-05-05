@@ -10,8 +10,13 @@ type ContribStat = {
 };
 
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
-const PER_REPO_DEADLINE_MS = 35_000;
-const ORG_DEADLINE_MS = 55_000;
+// Deadlines sized for Vercel's 60s maxDuration. With concurrency 6, a worker
+// can do at most ceil(N/6) rounds. The pre-dispatch check below skips a repo
+// whenever a fresh PER_REPO_DEADLINE_MS attempt would push past ORG_DEADLINE_MS,
+// so we never run into FUNCTION_INVOCATION_TIMEOUT. Cache hits return instantly,
+// so the per-repo deadline only applies when actually calling GitHub.
+const PER_REPO_DEADLINE_MS = 15_000;
+const ORG_DEADLINE_MS = 47_000;
 
 const RATE_LIMIT_HEADERS = [
   "x-ratelimit-limit",
@@ -350,11 +355,15 @@ export async function getOrgRaceData(opts: {
   const orgDeadlineMs = Date.now() + ORG_DEADLINE_MS;
 
   await withConcurrency(candidates, 6, async (repo) => {
-    if (Date.now() >= orgDeadlineMs) {
+    // Skip if a fresh per-repo attempt wouldn't fit within the remaining org
+    // budget — this is what prevents FUNCTION_INVOCATION_TIMEOUT on Vercel.
+    // Cache hits don't take real time, so we approximate "fresh attempt" with
+    // the worst case (PER_REPO_DEADLINE_MS).
+    if (Date.now() + PER_REPO_DEADLINE_MS > orgDeadlineMs) {
       warnings.push({
         repo: repo.full_name,
-        reason: "Skipped — request deadline reached before this repo was attempted",
-        message: "Hit Retry to fetch the missing repos. Successful repos are served from cache.",
+        reason: "Skipped — not enough time left in this request to attempt safely",
+        message: `Hit Retry to fetch the missing repos. Successful repos are served from our cache; only the skipped/failed ones will hit GitHub again. Budget per-repo: ${PER_REPO_DEADLINE_MS / 1000}s, org: ${ORG_DEADLINE_MS / 1000}s, max function: 60s.`,
         attempts: 0,
         lastStatus: null,
       });

@@ -66,8 +66,10 @@ export async function GET(req: NextRequest) {
       .map((w) => w.repo.slice(org.length + 1));
 
     if (stillComputing.length > 0) {
-      const remainingBudgetMs = Math.max(0, 60_000 - elapsedMs - 2_000);
-      if (remainingBudgetMs > 5_000) {
+      // Leave a 5s safety margin under maxDuration so Vercel doesn't kill the
+      // function while after() is mid-poke.
+      const remainingBudgetMs = Math.max(0, 60_000 - elapsedMs - 5_000);
+      if (remainingBudgetMs > 4_000) {
         after(async () => {
           try {
             await warmFailedRepos(org, stillComputing, remainingBudgetMs);
