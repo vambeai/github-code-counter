@@ -1,25 +1,34 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { saveOrg } from "@/lib/storage";
 
 const SUGGESTIONS = ["vercel", "facebook", "microsoft", "vuejs"];
 
 export default function OrgForm({
   onStart,
   loading,
+  initialOrg,
 }: {
   onStart: (org: string, month: string) => void;
   loading: boolean;
+  initialOrg?: string | null;
 }) {
-  const [org, setOrg] = useState("vercel");
+  const [org, setOrg] = useState(initialOrg || "vercel");
   const now = new Date();
   const defaultMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
   const [month, setMonth] = useState(defaultMonth);
 
+  useEffect(() => {
+    if (initialOrg) setOrg(initialOrg);
+  }, [initialOrg]);
+
   function submit(e: React.FormEvent) {
     e.preventDefault();
-    if (!org.trim() || loading) return;
-    onStart(org.trim(), month);
+    const trimmed = org.trim();
+    if (!trimmed || loading) return;
+    saveOrg(trimmed);
+    onStart(trimmed, month);
   }
 
   return (

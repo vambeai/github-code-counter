@@ -1,4 +1,5 @@
 import { Octokit } from "@octokit/rest";
+import { unstable_cache } from "next/cache";
 import type { Racer, RaceData, RepoRace } from "./types";
 
 type ContribWeek = { w: number; a: number; d: number; c: number };
@@ -217,4 +218,32 @@ export async function getOrgRaceData(opts: {
     warnings,
     generatedAt: new Date().toISOString(),
   };
+}
+
+// 1h server-side cache. The token is read from env inside the cached function
+// (not part of the cache key) so it doesn't leak into Vercel's data cache key.
+// Cache key: org + sinceISO + untilISO. Different month/org = different entry.
+const CACHE_TTL_SECONDS = 60 * 60;
+
+const cachedFetcher = unstable_cache(
+  async (org: string, sinceISO: string, untilISO: string): Promise<RaceData> => {
+    const token = process.env.GITHUB_TOKEN;
+    if (!token) throw new Error("Server is missing the GITHUB_TOKEN environment variable.");
+    return getOrgRaceData({
+      org,
+      since: new Date(sinceISO),
+      until: new Date(untilISO),
+      token,
+    });
+  },
+  ["github-code-race-v1"],
+  { revalidate: CACHE_TTL_SECONDS, tags: ["github-code-race"] }
+);
+
+export async function getCachedOrgRaceData(
+  org: string,
+  since: Date,
+  until: Date
+): Promise<RaceData> {
+  return cachedFetcher(org, since.toISOString(), until.toISOString());
 }

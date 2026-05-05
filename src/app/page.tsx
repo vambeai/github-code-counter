@@ -1,10 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import OrgForm from "@/components/OrgForm";
 import RaceTrack from "@/components/RaceTrack";
 import RepoBreakdown from "@/components/RepoBreakdown";
 import Scoreboard from "@/components/Scoreboard";
+import { loadSavedOrg } from "@/lib/storage";
 import type { RaceData } from "@/lib/types";
 
 function fmtNum(n: number) {
@@ -15,8 +16,9 @@ export default function Home() {
   const [data, setData] = useState<RaceData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [savedOrg, setSavedOrg] = useState<string | null>(null);
 
-  async function startRace(org: string, month: string) {
+  const startRace = useCallback(async (org: string, month: string) => {
     setLoading(true);
     setError(null);
     setData(null);
@@ -47,7 +49,19 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
+
+  // On first mount: hydrate the saved org from localStorage and auto-start
+  // the race. The server cache means this is essentially free if anyone has
+  // run the same org+month within the last hour.
+  useEffect(() => {
+    const org = loadSavedOrg();
+    if (!org) return;
+    setSavedOrg(org);
+    const now = new Date();
+    const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+    startRace(org, month);
+  }, [startRace]);
 
   const monthLabel = data
     ? new Date(data.since).toLocaleDateString("en-US", {
@@ -68,7 +82,7 @@ export default function Home() {
         </p>
       </header>
 
-      <OrgForm onStart={startRace} loading={loading} />
+      <OrgForm onStart={startRace} loading={loading} initialOrg={savedOrg} />
 
       {error && (
         <div className="mt-6 rounded-lg border border-red-500 bg-red-950/40 p-4 text-red-200">
@@ -89,6 +103,8 @@ export default function Home() {
                 <span className="text-rose-400">-{fmtNum(data.totalDeletions)}</span>
                 {"  ·  "}
                 {fmtNum(data.totalCommits)} commits across {data.repos.length} repos
+                {"  ·  "}
+                <CacheBadge generatedAt={data.generatedAt} />
               </>
             }
             racers={data.racers}
@@ -137,5 +153,32 @@ function LoadingScreen() {
         time it builds the cache for a repo.
       </p>
     </div>
+  );
+}
+
+function CacheBadge({ generatedAt }: { generatedAt: string }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  const ageSec = Math.max(0, Math.floor((Date.now() - new Date(generatedAt).getTime()) / 1000));
+  const fresh = ageSec < 60;
+  let label: string;
+  if (fresh) label = "fresh";
+  else if (ageSec < 3600) label = `cached ${Math.floor(ageSec / 60)}m ago`;
+  else label = `cached ${Math.floor(ageSec / 3600)}h ago`;
+  return (
+    <span
+      title={`Generated at ${new Date(generatedAt).toLocaleString()}`}
+      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest ${
+        fresh
+          ? "border-emerald-500/40 text-emerald-300"
+          : "border-zinc-700 text-zinc-400"
+      }`}
+    >
+      <span className={fresh ? "text-emerald-400" : "text-zinc-500"}>●</span>
+      {label}
+    </span>
   );
 }

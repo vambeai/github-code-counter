@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getOrgRaceData } from "@/lib/github";
+import { getCachedOrgRaceData } from "@/lib/github";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -55,9 +55,19 @@ export async function GET(req: NextRequest) {
   const until = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0));
 
   try {
-    const data = await getOrgRaceData({ org, since, until, token });
+    const data = await getCachedOrgRaceData(org, since, until);
+    const ageSeconds = Math.max(
+      0,
+      Math.round((Date.now() - new Date(data.generatedAt).getTime()) / 1000)
+    );
     return NextResponse.json(data, {
-      headers: { "Cache-Control": "public, s-maxage=300, stale-while-revalidate=600" },
+      headers: {
+        // 1h at the edge + on the client. SWR keeps stale data flowing for
+        // another hour while a single visitor revalidates in the background.
+        "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=3600",
+        "X-Cache-Generated-At": data.generatedAt,
+        "X-Cache-Age-Seconds": String(ageSeconds),
+      },
     });
   } catch (err: unknown) {
     const status = (err as { status?: number }).status;
