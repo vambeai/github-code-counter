@@ -18,6 +18,24 @@ export type RepoRace = {
   racers: Racer[];
 };
 
+export type Warning = {
+  repo: string;
+  reason: string;
+  message: string;
+  attempts: number;
+  lastStatus: number | null;
+  rateLimit?: {
+    limit?: string;
+    remaining?: string;
+    reset?: string;
+    used?: string;
+    resource?: string;
+  };
+  responseHeaders?: Record<string, string>;
+  rawBody?: string;
+  requestId?: string;
+};
+
 export type RaceData = {
   org: string;
   since: string;
@@ -27,6 +45,6 @@ export type RaceData = {
   totalCommits: number;
   racers: Racer[];
   repos: RepoRace[];
-  warnings: string[];
+  warnings: Warning[];
   generatedAt: string;
 };

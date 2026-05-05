@@ -5,6 +5,7 @@ import OrgForm from "@/components/OrgForm";
 import RaceTrack from "@/components/RaceTrack";
 import RepoBreakdown from "@/components/RepoBreakdown";
 import Scoreboard from "@/components/Scoreboard";
+import Warnings from "@/components/Warnings";
 import { loadSavedOrg } from "@/lib/storage";
 import type { RaceData } from "@/lib/types";
 
@@ -112,18 +113,7 @@ export default function Home() {
           />
           <Scoreboard racers={data.racers} />
           <RepoBreakdown repos={data.repos} since={data.since} />
-          {data.warnings.length > 0 && (
-            <details className="mt-8 rounded-lg border border-zinc-700 bg-zinc-900/40 p-3 text-sm text-zinc-400">
-              <summary className="cursor-pointer text-zinc-300">
-                {data.warnings.length} warning(s) — click to expand
-              </summary>
-              <ul className="mt-2 list-disc pl-5 space-y-1">
-                {data.warnings.map((w, i) => (
-                  <li key={i}>{w}</li>
-                ))}
-              </ul>
-            </details>
-          )}
+          <Warnings warnings={data.warnings} />
         </>
       )}
 

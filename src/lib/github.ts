@@ -1,6 +1,6 @@
 import { Octokit } from "@octokit/rest";
 import { unstable_cache } from "next/cache";
-import type { Racer, RaceData, RepoRace } from "./types";
+import type { Racer, RaceData, RepoRace, Warning } from "./types";
 
 type ContribWeek = { w: number; a: number; d: number; c: number };
 type ContribStat = {
@@ -11,46 +11,191 @@ type ContribStat = {
 
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
 
+const RATE_LIMIT_HEADERS = [
+  "x-ratelimit-limit",
+  "x-ratelimit-remaining",
+  "x-ratelimit-reset",
+  "x-ratelimit-used",
+  "x-ratelimit-resource",
+  "retry-after",
+  "x-github-request-id",
+  "x-github-media-type",
+  "etag",
+  "last-modified",
+  "x-github-api-version-selected",
+];
+
 async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function pickHeaders(
+  raw: Record<string, string | number | undefined> | undefined
+): Record<string, string> {
+  if (!raw) return {};
+  const out: Record<string, string> = {};
+  for (const key of RATE_LIMIT_HEADERS) {
+    const v = raw[key];
+    if (v !== undefined) out[key] = String(v);
+  }
+  return out;
+}
+
+type FetchOutcome =
+  | {
+      kind: "ok";
+      data: ContribStat[];
+      attempts: number;
+      lastStatus: number;
+      headers: Record<string, string>;
+    }
+  | {
+      kind: "deadline";
+      attempts: number;
+      lastStatus: number | null;
+      headers: Record<string, string>;
+    }
+  | {
+      kind: "error";
+      attempts: number;
+      lastStatus: number | null;
+      headers: Record<string, string>;
+      message: string;
+      rawBody?: string;
+    };
+
 // GitHub computes /stats/contributors lazily. The first request for a repo
 // returns 202 and kicks off a background job. We retry until either the data
-// is ready or we hit the request-wide deadline (so we always return JSON
-// before Vercel times out the function and serves a plaintext error).
+// is ready or we hit the request-wide deadline. This function records the
+// last status, attempts and response headers so callers can build detailed
+// warnings (rate-limit, request-id, etc.) for failed repos.
 async function fetchContribStats(
   octokit: Octokit,
   owner: string,
   repo: string,
   deadlineMs: number
-): Promise<ContribStat[] | null> {
+): Promise<FetchOutcome> {
   const MAX_ATTEMPTS = 12;
+  let attempts = 0;
+  let lastStatus: number | null = null;
+  let lastHeaders: Record<string, string> = {};
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    if (Date.now() >= deadlineMs) return null;
+    attempts = attempt + 1;
+    if (Date.now() >= deadlineMs) {
+      return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
+    }
     try {
       const res = await octokit.request("GET /repos/{owner}/{repo}/stats/contributors", {
         owner,
         repo,
       });
+      lastStatus = res.status;
+      lastHeaders = pickHeaders(
+        res.headers as Record<string, string | number | undefined>
+      );
       if (res.status === 202) {
         const wait = 2000 + attempt * 400;
-        if (Date.now() + wait >= deadlineMs) return null;
+        if (Date.now() + wait >= deadlineMs) {
+          return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
+        }
         await sleep(wait);
         continue;
       }
-      if (!Array.isArray(res.data)) return [];
-      return res.data as unknown as ContribStat[];
+      const data = (Array.isArray(res.data) ? res.data : []) as unknown as ContribStat[];
+      return { kind: "ok", data, attempts, lastStatus, headers: lastHeaders };
     } catch (err: unknown) {
-      const status = (err as { status?: number }).status;
-      if (status === 204 || status === 409) return [];
-      if (status === 404 || status === 403) throw err;
-      if (attempt === MAX_ATTEMPTS - 1) throw err;
-      if (Date.now() + 800 >= deadlineMs) return null;
+      const status = (err as { status?: number }).status ?? null;
+      const respHeaders =
+        (err as { response?: { headers?: Record<string, string | number | undefined> } })
+          .response?.headers;
+      const respBody = (err as { response?: { data?: unknown } }).response?.data;
+      lastStatus = status;
+      if (respHeaders) lastHeaders = pickHeaders(respHeaders);
+      if (status === 204 || status === 409) {
+        return { kind: "ok", data: [], attempts, lastStatus: status, headers: lastHeaders };
+      }
+      const message = err instanceof Error ? err.message : "unknown error";
+      const rawBody =
+        respBody === undefined
+          ? undefined
+          : typeof respBody === "string"
+            ? respBody.slice(0, 1000)
+            : JSON.stringify(respBody).slice(0, 1000);
+      if (status === 404 || status === 403 || status === 401 || status === 451) {
+        return {
+          kind: "error",
+          attempts,
+          lastStatus: status,
+          headers: lastHeaders,
+          message,
+          rawBody,
+        };
+      }
+      if (attempt === MAX_ATTEMPTS - 1) {
+        return {
+          kind: "error",
+          attempts,
+          lastStatus: status,
+          headers: lastHeaders,
+          message,
+          rawBody,
+        };
+      }
+      if (Date.now() + 800 >= deadlineMs) {
+        return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
+      }
       await sleep(800);
     }
   }
-  return null;
+  return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
+}
+
+function buildWarning(
+  repoFullName: string,
+  outcome: Exclude<FetchOutcome, { kind: "ok" }>
+): Warning {
+  const headers = outcome.headers;
+  const rateLimit = {
+    limit: headers["x-ratelimit-limit"],
+    remaining: headers["x-ratelimit-remaining"],
+    reset: headers["x-ratelimit-reset"],
+    used: headers["x-ratelimit-used"],
+    resource: headers["x-ratelimit-resource"],
+  };
+  const requestId = headers["x-github-request-id"];
+
+  if (outcome.kind === "deadline") {
+    const reason =
+      outcome.lastStatus === 202
+        ? "GitHub still computing stats (HTTP 202) past our 55s deadline"
+        : "Deadline reached before GitHub responded with data";
+    const message =
+      outcome.lastStatus === 202
+        ? "GitHub returned HTTP 202 (cache warming) on every retry. Hit START again — large repos can take >1 min on first hit; subsequent runs are instant."
+        : `Last seen status: ${outcome.lastStatus ?? "n/a"} after ${outcome.attempts} attempts.`;
+    return {
+      repo: repoFullName,
+      reason,
+      message,
+      attempts: outcome.attempts,
+      lastStatus: outcome.lastStatus,
+      rateLimit,
+      responseHeaders: headers,
+      requestId,
+    };
+  }
+  // error
+  return {
+    repo: repoFullName,
+    reason: `GitHub returned HTTP ${outcome.lastStatus ?? "?"}`,
+    message: outcome.message,
+    attempts: outcome.attempts,
+    lastStatus: outcome.lastStatus,
+    rateLimit,
+    responseHeaders: headers,
+    rawBody: outcome.rawBody,
+    requestId,
+  };
 }
 
 function aggregateWeeks(stats: ContribStat[], sinceTs: number, untilTs: number): Racer[] {
@@ -115,7 +260,6 @@ export async function getOrgRaceData(opts: {
   since: Date;
   until: Date;
   token: string;
-  pushedSinceFilter?: boolean;
 }): Promise<RaceData> {
   const { org, since, until, token } = opts;
   const octokit = new Octokit({ auth: token });
@@ -142,7 +286,7 @@ export async function getOrgRaceData(opts: {
     return true;
   });
 
-  const warnings: string[] = [];
+  const warnings: Warning[] = [];
   const repoRaces: RepoRace[] = [];
 
   // Soft deadline ~5s under Vercel's maxDuration so we always return JSON
@@ -151,39 +295,35 @@ export async function getOrgRaceData(opts: {
 
   await withConcurrency(candidates, 6, async (repo) => {
     if (Date.now() >= deadlineMs) {
-      warnings.push(
-        `${repo.full_name}: skipped (request deadline reached). Hit START again — anything that was computing should be ready now.`
-      );
+      warnings.push({
+        repo: repo.full_name,
+        reason: "Skipped — request deadline reached before this repo was attempted",
+        message: "Hit START again to retry.",
+        attempts: 0,
+        lastStatus: null,
+      });
       return;
     }
-    try {
-      const stats = await fetchContribStats(octokit, org, repo.name, deadlineMs);
-      if (stats === null) {
-        warnings.push(
-          `${repo.full_name}: GitHub is still building its contributor cache (first-time hit). Hit START again in ~30s and it'll be ready.`
-        );
-        return;
-      }
-      const racers = aggregateWeeks(stats, sinceTs, untilTs);
-      const totalAdditions = racers.reduce((s, r) => s + r.additions, 0);
-      const totalDeletions = racers.reduce((s, r) => s + r.deletions, 0);
-      const totalCommits = racers.reduce((s, r) => s + r.commits, 0);
-      if (totalCommits === 0 && totalAdditions === 0) return;
-      repoRaces.push({
-        name: repo.name,
-        fullName: repo.full_name,
-        htmlUrl: repo.html_url,
-        private: repo.private,
-        totalAdditions,
-        totalDeletions,
-        totalCommits,
-        racers,
-      });
-    } catch (err: unknown) {
-      const status = (err as { status?: number }).status;
-      const msg = err instanceof Error ? err.message : "unknown error";
-      warnings.push(`${repo.full_name}: ${status ?? ""} ${msg}`.trim());
+    const outcome = await fetchContribStats(octokit, org, repo.name, deadlineMs);
+    if (outcome.kind !== "ok") {
+      warnings.push(buildWarning(repo.full_name, outcome));
+      return;
     }
+    const racers = aggregateWeeks(outcome.data, sinceTs, untilTs);
+    const totalAdditions = racers.reduce((s, r) => s + r.additions, 0);
+    const totalDeletions = racers.reduce((s, r) => s + r.deletions, 0);
+    const totalCommits = racers.reduce((s, r) => s + r.commits, 0);
+    if (totalCommits === 0 && totalAdditions === 0) return;
+    repoRaces.push({
+      name: repo.name,
+      fullName: repo.full_name,
+      htmlUrl: repo.html_url,
+      private: repo.private,
+      totalAdditions,
+      totalDeletions,
+      totalCommits,
+      racers,
+    });
   });
 
   repoRaces.sort((a, b) => b.totalAdditions - a.totalAdditions);
@@ -236,7 +376,7 @@ const cachedFetcher = unstable_cache(
       token,
     });
   },
-  ["github-code-race-v1"],
+  ["github-code-race-v2"],
   { revalidate: CACHE_TTL_SECONDS, tags: ["github-code-race"] }
 );
 
