@@ -14,7 +14,8 @@ Watch your GitHub **organization's** contributors race for monthly **lines-of-co
 - 📊 Per-repo breakdown — click any repo to see its own race
 - 🥇 Full sortable scoreboard with avatars and links to GitHub profiles
 - 🔐 `GITHUB_TOKEN` lives **only on the server** (Next.js Route Handler) — never shipped to the browser
-- ⚡ Edge-cached responses (`s-maxage=300`) for cheap re-runs
+- 🎯 Exact per-day precision (powered by GitHub's GraphQL API — no lazy-cache 202 hell)
+- ⚡ Two-layer cache: 1h Vercel data cache per repo + edge cache (`s-maxage=3600`)
 - 🚀 One-click deploy to Vercel
 
 ---
@@ -23,13 +24,15 @@ Watch your GitHub **organization's** contributors race for monthly **lines-of-co
 
 The Next.js Route Handler at [`src/app/api/race/route.ts`](src/app/api/race/route.ts):
 
-1. Lists every repo in the org (`GET /orgs/{org}/repos?type=all`, paginated).
+1. Lists every repo in the org (`GET /orgs/{org}/repos?type=all`, paginated, cached 10 min).
 2. Filters out archived repos and repos that haven't been pushed since the start of the selected month.
-3. For each remaining repo, calls **`GET /repos/{owner}/{repo}/stats/contributors`** (cheap, weekly granular, no per-commit fan-out). Calls run with a concurrency limit of 6.
-4. Aggregates additions / deletions / commits per author for weeks that overlap the selected month, splitting boundary weeks proportionally (close enough for a horse race).
-5. Returns one merged **org-wide leaderboard** plus a **per-repo breakdown**.
+3. For each remaining repo, runs a **GraphQL query** against `repository.defaultBranchRef.target.history(since, until, first: 100)` and paginates until done. This returns commit-by-commit `additions`, `deletions`, `committedDate` and `author.user.login` — no lazy cache, no 202s, exact per-day precision. Calls run at concurrency 6.
+4. Aggregates additions / deletions / commits per author over the selected month and produces one merged **org-wide leaderboard** plus a **per-repo breakdown**.
+5. Each successful repo result is cached for 1h via [`unstable_cache`](https://nextjs.org/docs/app/api-reference/functions/unstable_cache), keyed on `org+repo+sinceISO+untilISO`. Repeat queries are essentially free.
 
 Your `GITHUB_TOKEN` is read from `process.env` inside the Route Handler — **it never reaches the client**.
+
+> 🧠 **Why GraphQL?** The REST `/stats/contributors` endpoint computes lazily and returns HTTP 202 on the first hit per repo, with no documented TTL. For org-wide scans this is unreliable ([GitHub Community discussion #190711](https://github.com/community/community/discussions/190711)). GraphQL queries are direct and predictable — typical cost per race is well under 5 GraphQL points (out of the 5,000/hour budget).
 
 ---
 
@@ -210,18 +213,19 @@ Response:
 }
 ```
 
-Responses include `Cache-Control: public, s-maxage=300, stale-while-revalidate=600` so Vercel's edge caches the result for 5 minutes per `org+month` query.
+Responses include `Cache-Control: public, s-maxage=3600, stale-while-revalidate=3600` plus debug headers `X-Cache-Generated-At` and `X-Cache-Age-Seconds` so you can tell if you're seeing fresh or cached data.
 
 ---
 
 ## 🧪 Notes & limitations
 
-- **First request can be slow.** GitHub computes contributor stats lazily and may return HTTP 202 the very first time. The server retries with backoff. After the first hit, subsequent runs are fast (and edge-cached).
-- **Weekly granularity.** The Stats API gives weekly buckets. Boundary weeks are prorated against the days that overlap the chosen month. For accurate rankings within a single month this is fine.
+- **Default branch only.** GraphQL `defaultBranchRef.history` only walks commits on the repo's default branch. Side-branch work counts only after it's merged. (For "lines shipped this month" that's the correct semantic anyway.)
+- **Force-push amnesia.** If someone rebases or squashes the default branch, commits removed from history will not be counted (true of any commit-based tool).
 - **Bot accounts** (Dependabot, Renovate, GitHub Actions) will appear if they pushed commits — they often win, sorry.
-- **Rate limits.** An authenticated token gives you 5,000 REST requests/hour. The app makes 1 + N calls per race (org repos + one per non-archived repo touched in the month).
-- **Empty repos** (no commits) are silently skipped.
-- **Stats temporarily unavailable.** If a repo's stats are still computing on GitHub's side after retries, it's listed in the `warnings[]` array and skipped.
+- **Rate limits.** Authenticated GraphQL gives you 5,000 *points* per hour. Most queries cost ~1 point regardless of how many repos/commits — the app stays well under budget.
+- **Per-repo cap.** The fetcher paginates up to 20 pages of 100 commits = 2,000 commits per repo per month. Anything beyond that is dropped with a warning. For ordinary org repos this is plenty; bump `MAX_PAGES_PER_REPO` if you have a Linux-sized monorepo.
+- **Empty repos** (no commits in the selected month) are silently skipped.
+- **Function timeouts.** A per-repo deadline (12s) and an org-level deadline (50s) protect against Vercel's `maxDuration` ceiling. Repos that don't fit get a warning and the **Retry skipped repos** button re-fetches just those (successful repos come from the 1h cache).
 
 ---
 

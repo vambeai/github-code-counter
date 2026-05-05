@@ -2,256 +2,221 @@ import { Octokit } from "@octokit/rest";
 import { unstable_cache } from "next/cache";
 import type { Racer, RaceData, RepoRace, Warning } from "./types";
 
-type ContribWeek = { w: number; a: number; d: number; c: number };
-type ContribStat = {
-  total: number;
-  weeks: ContribWeek[];
-  author: { login: string; avatar_url: string; html_url: string } | null;
+// Per-repo deadline covers up to ~20 pages of 100 commits via GraphQL. For
+// typical org repos that's well over a month's worth of commits.
+const PER_REPO_DEADLINE_MS = 12_000;
+const ORG_DEADLINE_MS = 50_000;
+const MAIN_CONCURRENCY = 6;
+const MAX_PAGES_PER_REPO = 20;
+
+type CommitNode = {
+  oid: string;
+  additions: number;
+  deletions: number;
+  committedDate: string;
+  author: {
+    user: { login: string; avatarUrl: string; url: string } | null;
+    name: string | null;
+    email: string | null;
+  } | null;
 };
 
-const WEEK_SECONDS = 7 * 24 * 60 * 60;
-// Strategy (informed by GitHub Community discussion #190711):
-//
-//  * GitHub's /stats/contributors background-job queue gets overwhelmed when
-//    you fire many concurrent requests, so 202s become *persistent*. Their
-//    own best-practices say "make requests serially, not concurrently."
-//  * We compromise: low concurrency in the main fetch (3 in flight) with
-//    short per-repo budget (5s, ~3 quick attempts), so the user gets a fast
-//    response with warnings for anything still cold.
-//  * Then `after()` runs a strictly serial warmer (1.5s between repos, ONE
-//    poke each — no polling), which lets GitHub's queue drain. By the next
-//    user race (30-60s later), the cache is hot and everything 200s.
-const PER_REPO_DEADLINE_MS = 5_000;
-const ORG_DEADLINE_MS = 40_000;
-const MAIN_CONCURRENCY = 3;
-const WARMER_GAP_MS = 1_500;
+type HistoryPage = {
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+  nodes: CommitNode[];
+};
 
-const RATE_LIMIT_HEADERS = [
-  "x-ratelimit-limit",
-  "x-ratelimit-remaining",
-  "x-ratelimit-reset",
-  "x-ratelimit-used",
-  "x-ratelimit-resource",
-  "retry-after",
-  "x-github-request-id",
-  "x-github-media-type",
-  "etag",
-  "last-modified",
-  "x-github-api-version-selected",
-];
+type GraphQLResponse = {
+  repository: {
+    defaultBranchRef: {
+      target: {
+        history: HistoryPage;
+      } | null;
+    } | null;
+  } | null;
+};
 
-async function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function pickHeaders(
-  raw: Record<string, string | number | undefined> | undefined
-): Record<string, string> {
-  if (!raw) return {};
-  const out: Record<string, string> = {};
-  for (const key of RATE_LIMIT_HEADERS) {
-    const v = raw[key];
-    if (v !== undefined) out[key] = String(v);
+const COMMIT_HISTORY_QUERY = /* GraphQL */ `
+  query CommitHistory(
+    $owner: String!
+    $name: String!
+    $since: GitTimestamp!
+    $until: GitTimestamp!
+    $cursor: String
+  ) {
+    repository(owner: $owner, name: $name) {
+      defaultBranchRef {
+        target {
+          ... on Commit {
+            history(since: $since, until: $until, first: 100, after: $cursor) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                oid
+                additions
+                deletions
+                committedDate
+                author {
+                  user {
+                    login
+                    avatarUrl
+                    url
+                  }
+                  name
+                  email
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
-  return out;
-}
+`;
 
 type FetchOutcome =
   | {
       kind: "ok";
-      data: ContribStat[];
-      attempts: number;
-      lastStatus: number;
-      headers: Record<string, string>;
+      commits: CommitNode[];
+      pages: number;
+      truncated: boolean;
     }
   | {
       kind: "deadline";
-      attempts: number;
-      lastStatus: number | null;
-      headers: Record<string, string>;
+      pages: number;
+      partial: CommitNode[];
     }
   | {
       kind: "error";
-      attempts: number;
-      lastStatus: number | null;
-      headers: Record<string, string>;
       message: string;
+      status: number | null;
+      pages: number;
       rawBody?: string;
     };
 
-async function fetchContribStats(
+async function fetchCommitHistory(
   octokit: Octokit,
   owner: string,
-  repo: string,
+  name: string,
+  sinceISO: string,
+  untilISO: string,
   deadlineMs: number
 ): Promise<FetchOutcome> {
-  // Few quick attempts only. We rely on the after() warmer + a user retry to
-  // catch repos whose stats are still computing (per GitHub's "serial, not
-  // parallel" best practice).
-  const MAX_ATTEMPTS = 3;
-  let attempts = 0;
-  let lastStatus: number | null = null;
-  let lastHeaders: Record<string, string> = {};
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    attempts = attempt + 1;
+  const all: CommitNode[] = [];
+  let cursor: string | null = null;
+  let pages = 0;
+  while (pages < MAX_PAGES_PER_REPO) {
     if (Date.now() >= deadlineMs) {
-      return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
+      return { kind: "deadline", pages, partial: all };
     }
     try {
-      const res = await octokit.request("GET /repos/{owner}/{repo}/stats/contributors", {
+      const data = (await octokit.graphql(COMMIT_HISTORY_QUERY, {
         owner,
-        repo,
-      });
-      lastStatus = res.status;
-      lastHeaders = pickHeaders(
-        res.headers as Record<string, string | number | undefined>
-      );
-      if (res.status === 202) {
-        const wait = 1200 + attempt * 400; // 1.2s, 1.6s, 2.0s
-        if (Date.now() + wait >= deadlineMs) {
-          return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
-        }
-        await sleep(wait);
-        continue;
+        name,
+        since: sinceISO,
+        until: untilISO,
+        cursor,
+      })) as GraphQLResponse;
+      pages += 1;
+      const history = data.repository?.defaultBranchRef?.target?.history;
+      if (!history) {
+        // Empty repo, no default branch, or non-Commit target.
+        return { kind: "ok", commits: all, pages, truncated: false };
       }
-      const data = (Array.isArray(res.data) ? res.data : []) as unknown as ContribStat[];
-      return { kind: "ok", data, attempts, lastStatus, headers: lastHeaders };
+      all.push(...history.nodes);
+      if (!history.pageInfo.hasNextPage) {
+        return { kind: "ok", commits: all, pages, truncated: false };
+      }
+      cursor = history.pageInfo.endCursor;
     } catch (err: unknown) {
       const status = (err as { status?: number }).status ?? null;
-      const respHeaders =
-        (err as { response?: { headers?: Record<string, string | number | undefined> } })
-          .response?.headers;
-      const respBody = (err as { response?: { data?: unknown } }).response?.data;
-      lastStatus = status;
-      if (respHeaders) lastHeaders = pickHeaders(respHeaders);
-      if (status === 204 || status === 409) {
-        return { kind: "ok", data: [], attempts, lastStatus: status, headers: lastHeaders };
-      }
-      const message = err instanceof Error ? err.message : "unknown error";
-      const rawBody =
-        respBody === undefined
-          ? undefined
-          : typeof respBody === "string"
-            ? respBody.slice(0, 1000)
-            : JSON.stringify(respBody).slice(0, 1000);
-      if (status === 404 || status === 403 || status === 401 || status === 451) {
-        return {
-          kind: "error",
-          attempts,
-          lastStatus: status,
-          headers: lastHeaders,
-          message,
-          rawBody,
-        };
-      }
-      if (attempt === MAX_ATTEMPTS - 1) {
-        return {
-          kind: "error",
-          attempts,
-          lastStatus: status,
-          headers: lastHeaders,
-          message,
-          rawBody,
-        };
-      }
-      if (Date.now() + 800 >= deadlineMs) {
-        return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
-      }
-      await sleep(800);
+      const message = err instanceof Error ? err.message : "GraphQL error";
+      const rawBody = (() => {
+        const responseData = (err as { response?: { data?: unknown } }).response?.data;
+        if (responseData === undefined) return undefined;
+        if (typeof responseData === "string") return responseData.slice(0, 1000);
+        return JSON.stringify(responseData).slice(0, 1000);
+      })();
+      return { kind: "error", message, status, pages, rawBody };
     }
   }
-  return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
+  return { kind: "ok", commits: all, pages, truncated: true };
 }
 
 function buildWarning(
   repoFullName: string,
   outcome: Exclude<FetchOutcome, { kind: "ok" }>
 ): Warning {
-  const headers = outcome.headers;
-  const rateLimit = {
-    limit: headers["x-ratelimit-limit"],
-    remaining: headers["x-ratelimit-remaining"],
-    reset: headers["x-ratelimit-reset"],
-    used: headers["x-ratelimit-used"],
-    resource: headers["x-ratelimit-resource"],
-  };
-  const requestId = headers["x-github-request-id"];
-
   if (outcome.kind === "deadline") {
-    const reason =
-      outcome.lastStatus === 202
-        ? "GitHub still computing stats (HTTP 202) past deadline"
-        : "Deadline reached before GitHub responded with data";
-    const message =
-      outcome.lastStatus === 202
-        ? "GitHub returned HTTP 202 (cache warming) on every retry. The server is now warming this repo in the background — hit Retry in ~30-60s."
-        : `Last seen status: ${outcome.lastStatus ?? "n/a"} after ${outcome.attempts} attempts.`;
     return {
       repo: repoFullName,
-      reason,
-      message,
-      attempts: outcome.attempts,
-      lastStatus: outcome.lastStatus,
-      rateLimit,
-      responseHeaders: headers,
-      requestId,
+      reason: `Per-repo deadline reached after ${outcome.pages} GraphQL page(s)`,
+      message: `Got ${outcome.partial.length} commits before time ran out. Hit Retry — successful repos will be served from cache so this one gets the full budget.`,
+      attempts: outcome.pages,
+      lastStatus: 200,
     };
   }
   return {
     repo: repoFullName,
-    reason: `GitHub returned HTTP ${outcome.lastStatus ?? "?"}`,
+    reason: `GraphQL request failed (HTTP ${outcome.status ?? "?"})`,
     message: outcome.message,
-    attempts: outcome.attempts,
-    lastStatus: outcome.lastStatus,
-    rateLimit,
-    responseHeaders: headers,
+    attempts: outcome.pages || 1,
+    lastStatus: outcome.status,
     rawBody: outcome.rawBody,
-    requestId,
   };
 }
 
-function aggregateWeeks(stats: ContribStat[], sinceTs: number, untilTs: number): Racer[] {
-  return stats
-    .map((s) => {
-      let additions = 0;
-      let deletions = 0;
-      let commits = 0;
-      for (const w of s.weeks) {
-        const weekStart = w.w;
-        const weekEnd = w.w + WEEK_SECONDS;
-        if (weekEnd <= sinceTs || weekStart >= untilTs) continue;
-        const overlapStart = Math.max(weekStart, sinceTs);
-        const overlapEnd = Math.min(weekEnd, untilTs);
-        const overlap = (overlapEnd - overlapStart) / WEEK_SECONDS;
-        additions += Math.round(w.a * overlap);
-        deletions += Math.round(w.d * overlap);
-        commits += Math.round(w.c * overlap);
-      }
-      return {
-        login: s.author?.login ?? "ghost",
-        avatarUrl: s.author?.avatar_url ?? "",
-        htmlUrl: s.author?.html_url ?? "#",
-        additions,
-        deletions,
-        commits,
-      } satisfies Racer;
-    })
-    .filter((r) => r.commits > 0 || r.additions > 0)
+function aggregateCommits(commits: CommitNode[]): Racer[] {
+  const byKey = new Map<string, Racer>();
+  for (const c of commits) {
+    const author = c.author;
+    if (!author) continue;
+    let key: string;
+    let login: string;
+    let avatarUrl: string;
+    let htmlUrl: string;
+    if (author.user) {
+      key = author.user.login;
+      login = author.user.login;
+      avatarUrl = author.user.avatarUrl;
+      htmlUrl = author.user.url;
+    } else if (author.email || author.name) {
+      const email = author.email ?? "";
+      const name = author.name ?? "anonymous";
+      key = email ? `email:${email}` : `name:${name}`;
+      login = name;
+      avatarUrl = "";
+      htmlUrl = "#";
+    } else {
+      continue;
+    }
+    let racer = byKey.get(key);
+    if (!racer) {
+      racer = { login, avatarUrl, htmlUrl, additions: 0, deletions: 0, commits: 0 };
+      byKey.set(key, racer);
+    }
+    racer.additions += c.additions;
+    racer.deletions += c.deletions;
+    racer.commits += 1;
+  }
+  return Array.from(byKey.values())
+    .filter((r) => r.commits > 0)
     .sort((a, b) => b.additions - a.additions);
 }
 
 class RepoFetchFailure extends Error {
   outcome: Exclude<FetchOutcome, { kind: "ok" }>;
-  constructor(repoFullName: string, outcome: Exclude<FetchOutcome, { kind: "ok" }>) {
-    super(`Repo fetch failed: ${repoFullName}`);
+  fullName: string;
+  constructor(fullName: string, outcome: Exclude<FetchOutcome, { kind: "ok" }>) {
+    super(`Repo fetch failed: ${fullName}`);
     this.outcome = outcome;
+    this.fullName = fullName;
     this.name = "RepoFetchFailure";
   }
 }
 
-// Fetches a single repo's race, with its own deadline. SUCCESS is what gets
-// cached by unstable_cache; FAILURES throw RepoFetchFailure (which Next.js
-// does not cache), so the next call retries them automatically.
 async function fetchRepoRaceUncached(
   org: string,
   repoName: string,
@@ -263,18 +228,16 @@ async function fetchRepoRaceUncached(
   const token = process.env.GITHUB_TOKEN;
   if (!token) throw new Error("Server is missing the GITHUB_TOKEN environment variable.");
   const octokit = new Octokit({ auth: token });
-  const sinceTs = Math.floor(new Date(sinceISO).getTime() / 1000);
-  const untilTs = Math.floor(new Date(untilISO).getTime() / 1000);
-  const deadline = Date.now() + PER_REPO_DEADLINE_MS;
-  const outcome = await fetchContribStats(octokit, org, repoName, deadline);
+  const deadlineMs = Date.now() + PER_REPO_DEADLINE_MS;
+  const outcome = await fetchCommitHistory(octokit, org, repoName, sinceISO, untilISO, deadlineMs);
   if (outcome.kind !== "ok") {
     throw new RepoFetchFailure(`${org}/${repoName}`, outcome);
   }
-  const racers = aggregateWeeks(outcome.data, sinceTs, untilTs);
+  const racers = aggregateCommits(outcome.commits);
   const totalAdditions = racers.reduce((s, r) => s + r.additions, 0);
   const totalDeletions = racers.reduce((s, r) => s + r.deletions, 0);
   const totalCommits = racers.reduce((s, r) => s + r.commits, 0);
-  if (totalCommits === 0 && totalAdditions === 0) return null;
+  if (totalCommits === 0) return null;
   return {
     name: repoName,
     fullName: `${org}/${repoName}`,
@@ -287,13 +250,9 @@ async function fetchRepoRaceUncached(
   };
 }
 
-// Per-repo cache. Cache key = org + repoName + sinceISO + untilISO.
-// Successful results (RepoRace OR null for empty repos) cached for 1h.
-// Thrown RepoFetchFailure is NOT cached, so the same repo gets retried
-// next request — exactly what we want for GitHub's 202 lazy cache.
 const cachedFetchRepoRace = unstable_cache(
   fetchRepoRaceUncached,
-  ["repo-race-v1"],
+  ["repo-race-graphql-v1"],
   { revalidate: 60 * 60, tags: ["github-code-race"] }
 );
 
@@ -366,15 +325,11 @@ export async function getOrgRaceData(opts: {
   const orgDeadlineMs = Date.now() + ORG_DEADLINE_MS;
 
   await withConcurrency(candidates, MAIN_CONCURRENCY, async (repo) => {
-    // Skip if a fresh per-repo attempt wouldn't fit within the remaining org
-    // budget — this is what prevents FUNCTION_INVOCATION_TIMEOUT on Vercel.
-    // Cache hits don't take real time, so we approximate "fresh attempt" with
-    // the worst case (PER_REPO_DEADLINE_MS).
     if (Date.now() + PER_REPO_DEADLINE_MS > orgDeadlineMs) {
       warnings.push({
         repo: repo.full_name,
-        reason: "Skipped — not enough time left in this request to attempt safely",
-        message: `Hit Retry to fetch the missing repos. Successful repos are served from our cache; only the skipped/failed ones will hit GitHub again. Budget per-repo: ${PER_REPO_DEADLINE_MS / 1000}s, org: ${ORG_DEADLINE_MS / 1000}s, max function: 60s.`,
+        reason: "Skipped — not enough time left in this request",
+        message: "Hit Retry to fetch the missing repos. Successful repos are served from cache.",
         attempts: 0,
         lastStatus: null,
       });
@@ -392,13 +347,13 @@ export async function getOrgRaceData(opts: {
       if (result) repoRaces.push(result);
     } catch (err: unknown) {
       if (err instanceof RepoFetchFailure) {
-        warnings.push(buildWarning(err.message.replace("Repo fetch failed: ", ""), err.outcome));
+        warnings.push(buildWarning(err.fullName, err.outcome));
         return;
       }
-      // Sometimes class identity gets stripped through unstable_cache; duck-type fallback.
       const outcome = (err as { outcome?: Exclude<FetchOutcome, { kind: "ok" }> }).outcome;
+      const fullName = (err as { fullName?: string }).fullName ?? repo.full_name;
       if (outcome) {
-        warnings.push(buildWarning(repo.full_name, outcome));
+        warnings.push(buildWarning(fullName, outcome));
         return;
       }
       const message = err instanceof Error ? err.message : String(err);
@@ -451,45 +406,5 @@ export async function getCachedOrgRaceData(
   since: Date,
   until: Date
 ): Promise<RaceData> {
-  // No top-level cache: per-repo entries already cache the expensive parts,
-  // and we don't want failed-repo warnings to be cached at the org level
-  // (they should re-fetch on every retry).
   return getOrgRaceData({ org, since, until });
-}
-
-// Strictly-serial cache warmer. Per GitHub Community discussion #190711, the
-// /stats/contributors endpoint's background-job queue gets overwhelmed by
-// concurrent requests; the official guidance is "make requests serially, not
-// concurrently." We poke each repo once with a small gap, accept whatever
-// status comes back, and move on. By the time the user retries the race
-// (UI default: 60s countdown), GitHub will have computed everything.
-export async function warmFailedRepos(
-  org: string,
-  repoNames: string[],
-  budgetMs: number
-): Promise<{ poked: string[]; skipped: string[] }> {
-  const token = process.env.GITHUB_TOKEN;
-  if (!token) return { poked: [], skipped: repoNames };
-  const octokit = new Octokit({ auth: token });
-  const deadline = Date.now() + budgetMs;
-  const poked: string[] = [];
-  const skipped: string[] = [];
-  for (const repoName of repoNames) {
-    if (Date.now() >= deadline) {
-      skipped.push(repoName);
-      continue;
-    }
-    try {
-      await octokit.request("GET /repos/{owner}/{repo}/stats/contributors", {
-        owner: org,
-        repo: repoName,
-      });
-      poked.push(repoName);
-    } catch {
-      skipped.push(repoName);
-    }
-    if (Date.now() + WARMER_GAP_MS >= deadline) continue;
-    await sleep(WARMER_GAP_MS);
-  }
-  return { poked, skipped };
 }
