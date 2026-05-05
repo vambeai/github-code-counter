@@ -16,13 +16,20 @@ function fmtNum(n: number) {
 export default function Home() {
   const [data, setData] = useState<RaceData | null>(null);
   const [loading, setLoading] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedOrg, setSavedOrg] = useState<string | null>(null);
+  const [lastQuery, setLastQuery] = useState<{ org: string; month: string } | null>(null);
 
-  const startRace = useCallback(async (org: string, month: string) => {
-    setLoading(true);
+  const startRace = useCallback(async (org: string, month: string, mode: "full" | "retry" = "full") => {
+    if (mode === "retry") {
+      setRetrying(true);
+    } else {
+      setLoading(true);
+      setData(null);
+    }
     setError(null);
-    setData(null);
+    setLastQuery({ org, month });
     try {
       const params = new URLSearchParams({ org });
       if (month) params.set("month", month);
@@ -49,8 +56,14 @@ export default function Home() {
       setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
       setLoading(false);
+      setRetrying(false);
     }
   }, []);
+
+  const retrySkippedRepos = useCallback(() => {
+    if (!lastQuery) return;
+    void startRace(lastQuery.org, lastQuery.month, "retry");
+  }, [lastQuery, startRace]);
 
   // On first mount: hydrate the saved org from localStorage and auto-start
   // the race. The server cache means this is essentially free if anyone has
@@ -113,7 +126,11 @@ export default function Home() {
           />
           <Scoreboard racers={data.racers} />
           <RepoBreakdown repos={data.repos} since={data.since} />
-          <Warnings warnings={data.warnings} />
+          <Warnings
+            warnings={data.warnings}
+            onRetry={retrySkippedRepos}
+            retrying={retrying}
+          />
         </>
       )}
 

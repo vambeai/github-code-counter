@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import type { Warning } from "@/lib/types";
 
 function formatRateLimitReset(reset?: string): string | null {
@@ -13,21 +14,81 @@ function formatRateLimitReset(reset?: string): string | null {
   return `${date.toLocaleString()} (in ${Math.round(inSeconds / 60)}m)`;
 }
 
-export default function Warnings({ warnings }: { warnings: Warning[] }) {
+export default function Warnings({
+  warnings,
+  onRetry,
+  retrying,
+  warmingCount,
+}: {
+  warnings: Warning[];
+  onRetry?: () => void;
+  retrying?: boolean;
+  warmingCount?: number;
+}) {
   if (warnings.length === 0) return null;
 
+  const stillComputingCount = warnings.filter((w) => w.lastStatus === 202).length;
+
   return (
-    <details className="mt-8 rounded-lg border border-amber-700/50 bg-amber-950/20 p-3 text-sm text-amber-100">
+    <details
+      open
+      className="mt-8 rounded-lg border border-amber-700/50 bg-amber-950/20 p-3 text-sm text-amber-100"
+    >
       <summary className="cursor-pointer text-amber-200 font-semibold">
         🟡 {warnings.length} repo{warnings.length === 1 ? "" : "s"} skipped — click to inspect raw
         GitHub responses
       </summary>
+
+      {(stillComputingCount > 0 || warmingCount) && (
+        <div className="mt-3 rounded-md border border-amber-700/40 bg-amber-900/20 p-3 text-amber-100 flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <div className="font-semibold">🔥 GitHub is warming caches in the background</div>
+            <div className="text-xs text-amber-200/80 mt-1">
+              The server kept poking GitHub after your last request, so most of these should be
+              ready in 30-60s. Successful repos are already cached on our side and won&apos;t be
+              re-fetched.
+            </div>
+          </div>
+          {onRetry && (
+            <RetryButton onRetry={onRetry} retrying={!!retrying} />
+          )}
+        </div>
+      )}
+
       <div className="mt-3 space-y-3">
         {warnings.map((w, i) => (
           <WarningCard key={i} warning={w} />
         ))}
       </div>
     </details>
+  );
+}
+
+function RetryButton({ onRetry, retrying }: { onRetry: () => void; retrying: boolean }) {
+  // After mount, count down 30s and enable a "Retry now" affordance.
+  const [secondsLeft, setSecondsLeft] = useState(30);
+  useEffect(() => {
+    if (retrying) return;
+    setSecondsLeft(30);
+    const id = setInterval(() => {
+      setSecondsLeft((s) => Math.max(0, s - 1));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [retrying]);
+
+  const ready = secondsLeft === 0;
+  return (
+    <button
+      onClick={onRetry}
+      disabled={retrying}
+      className="race-title rounded-lg bg-yellow-300 text-zinc-900 px-4 py-2 hover:bg-yellow-200 transition disabled:opacity-50 whitespace-nowrap"
+    >
+      {retrying
+        ? "RETRYING..."
+        : ready
+          ? "RETRY SKIPPED REPOS"
+          : `RETRY IN ${secondsLeft}s (or now)`}
+    </button>
   );
 }
 

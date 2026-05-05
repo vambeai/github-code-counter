@@ -1,5 +1,5 @@
-import { NextRequest, NextResponse } from "next/server";
-import { getCachedOrgRaceData } from "@/lib/github";
+import { NextRequest, NextResponse, after } from "next/server";
+import { getCachedOrgRaceData, warmFailedRepos } from "@/lib/github";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,10 +10,8 @@ const ORG_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 function parseOrg(input: string): string | null {
   let value = input.trim();
   if (!value) return null;
-  // Allow pasting a github URL like https://github.com/vercel
   const urlMatch = value.match(/^https?:\/\/github\.com\/([^/?#]+)/i);
   if (urlMatch) value = urlMatch[1];
-  // Strip trailing slash or path segments (e.g. "vercel/next.js")
   value = value.split("/")[0];
   if (!ORG_PATTERN.test(value)) return null;
   return value;
@@ -55,18 +53,42 @@ export async function GET(req: NextRequest) {
   const until = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0));
 
   try {
+    const startedAt = Date.now();
     const data = await getCachedOrgRaceData(org, since, until);
+    const elapsedMs = Date.now() - startedAt;
+
+    // Repos that came back as HTTP 202 ("still computing"): we kicked off the
+    // background job on GitHub's side; now we keep poking them in the after()
+    // hook so GitHub finishes computing and the next user-driven race finds
+    // them cached. We use whatever serverless budget is left.
+    const stillComputing = data.warnings
+      .filter((w) => w.lastStatus === 202 && w.repo.startsWith(`${org}/`))
+      .map((w) => w.repo.slice(org.length + 1));
+
+    if (stillComputing.length > 0) {
+      const remainingBudgetMs = Math.max(0, 60_000 - elapsedMs - 2_000);
+      if (remainingBudgetMs > 5_000) {
+        after(async () => {
+          try {
+            await warmFailedRepos(org, stillComputing, remainingBudgetMs);
+          } catch {
+            // best effort
+          }
+        });
+      }
+    }
+
     const ageSeconds = Math.max(
       0,
       Math.round((Date.now() - new Date(data.generatedAt).getTime()) / 1000)
     );
     return NextResponse.json(data, {
       headers: {
-        // 1h at the edge + on the client. SWR keeps stale data flowing for
-        // another hour while a single visitor revalidates in the background.
+        // Edge cache for 1h. Per-repo data lives in Next.js' data cache, also 1h.
         "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=3600",
         "X-Cache-Generated-At": data.generatedAt,
         "X-Cache-Age-Seconds": String(ageSeconds),
+        "X-Warming-Repos": String(stillComputing.length),
       },
     });
   } catch (err: unknown) {
