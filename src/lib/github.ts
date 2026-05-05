@@ -15,22 +15,27 @@ async function sleep(ms: number) {
 }
 
 // GitHub computes /stats/contributors lazily. The first request for a repo
-// returns 202 and kicks off a background job. We retry up to ~40s, well under
-// the route's 60s maxDuration.
+// returns 202 and kicks off a background job. We retry until either the data
+// is ready or we hit the request-wide deadline (so we always return JSON
+// before Vercel times out the function and serves a plaintext error).
 async function fetchContribStats(
   octokit: Octokit,
   owner: string,
-  repo: string
+  repo: string,
+  deadlineMs: number
 ): Promise<ContribStat[] | null> {
   const MAX_ATTEMPTS = 12;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (Date.now() >= deadlineMs) return null;
     try {
       const res = await octokit.request("GET /repos/{owner}/{repo}/stats/contributors", {
         owner,
         repo,
       });
       if (res.status === 202) {
-        await sleep(2000 + attempt * 400);
+        const wait = 2000 + attempt * 400;
+        if (Date.now() + wait >= deadlineMs) return null;
+        await sleep(wait);
         continue;
       }
       if (!Array.isArray(res.data)) return [];
@@ -40,6 +45,7 @@ async function fetchContribStats(
       if (status === 204 || status === 409) return [];
       if (status === 404 || status === 403) throw err;
       if (attempt === MAX_ATTEMPTS - 1) throw err;
+      if (Date.now() + 800 >= deadlineMs) return null;
       await sleep(800);
     }
   }
@@ -138,9 +144,19 @@ export async function getOrgRaceData(opts: {
   const warnings: string[] = [];
   const repoRaces: RepoRace[] = [];
 
+  // Soft deadline ~5s under Vercel's maxDuration so we always return JSON
+  // (with partial results + warnings) instead of a plaintext timeout page.
+  const deadlineMs = Date.now() + 55_000;
+
   await withConcurrency(candidates, 6, async (repo) => {
+    if (Date.now() >= deadlineMs) {
+      warnings.push(
+        `${repo.full_name}: skipped (request deadline reached). Hit START again — anything that was computing should be ready now.`
+      );
+      return;
+    }
     try {
-      const stats = await fetchContribStats(octokit, org, repo.name);
+      const stats = await fetchContribStats(octokit, org, repo.name, deadlineMs);
       if (stats === null) {
         warnings.push(
           `${repo.full_name}: GitHub is still building its contributor cache (first-time hit). Hit START again in ~30s and it'll be ready.`

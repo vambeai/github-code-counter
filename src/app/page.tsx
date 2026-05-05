@@ -24,9 +24,24 @@ export default function Home() {
       const params = new URLSearchParams({ org });
       if (month) params.set("month", month);
       const res = await fetch(`/api/race?${params.toString()}`);
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Failed to load race");
-      setData(json);
+      const text = await res.text();
+      let json: RaceData | { error?: string } | null = null;
+      try {
+        json = text ? (JSON.parse(text) as RaceData | { error?: string }) : null;
+      } catch {
+        // Non-JSON body — usually a Vercel platform error (timeout, gateway).
+      }
+      if (!res.ok) {
+        const fromJson = json && "error" in json ? json.error : undefined;
+        const snippet = text ? text.slice(0, 180) : `HTTP ${res.status}`;
+        throw new Error(fromJson || snippet);
+      }
+      if (!json) {
+        throw new Error(
+          `The server returned a non-JSON response (${res.status}) — likely a Vercel function timeout. Hit START again; repos that just finished computing on GitHub will be cached now.`
+        );
+      }
+      setData(json as RaceData);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
