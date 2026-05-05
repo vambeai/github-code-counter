@@ -48,11 +48,19 @@ export default function RepoBreakdown({ repos, since }: { repos: RepoRace[]; sin
               >
                 <div className="flex items-center justify-between gap-2 mb-2">
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <span className="race-title text-zinc-100 truncate">{repo.name}</span>
                       {repo.private && (
                         <span className="text-[10px] uppercase tracking-widest border border-zinc-700 rounded px-1.5 py-0.5 text-zinc-400">
                           private
+                        </span>
+                      )}
+                      {repo.truncated && (
+                        <span
+                          title={repo.truncationNote}
+                          className="text-[10px] uppercase tracking-widest border border-amber-700/60 rounded px-1.5 py-0.5 text-amber-300"
+                        >
+                          partial
                         </span>
                       )}
                     </div>

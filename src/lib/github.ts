@@ -2,12 +2,19 @@ import { Octokit } from "@octokit/rest";
 import { unstable_cache } from "next/cache";
 import type { CommitInfo, Racer, RaceData, RepoRace, Warning } from "./types";
 
-// Per-repo deadline covers up to ~20 pages of 100 commits via GraphQL plus
-// a handful of REST per-commit detail calls for big commits. For typical org
-// repos that's well over a month's worth of commits.
-const PER_REPO_DEADLINE_MS = 18_000;
-const ORG_DEADLINE_MS = 50_000;
-const MAIN_CONCURRENCY = 6;
+// Budget tuning for Vercel's 60s maxDuration:
+//  * Concurrency 11 lets a 21-repo org (e.g. vambeai) finish in 2 parallel
+//    rounds.
+//  * 25s per repo covers GraphQL pagination + per-commit REST detail calls
+//    for the 10k file-line-threshold filter, even on heavy repos with many
+//    big commits.
+//  * 54s org deadline means 2 * 25s rounds + ~2s for repo listing all fit
+//    comfortably under maxDuration with margin.
+//  * If a single repo's deadline hits mid-pagination, we now KEEP the
+//    commits gathered so far (truncated=true) instead of throwing them away.
+const PER_REPO_DEADLINE_MS = 25_000;
+const ORG_DEADLINE_MS = 54_000;
+const MAIN_CONCURRENCY = 11;
 const MAX_PAGES_PER_REPO = 20;
 // Per-file (NOT per-commit) threshold. Any single file in a commit whose
 // additions OR deletions exceed this is excluded — lockfiles, generated
@@ -459,16 +466,33 @@ async function fetchRepoRaceUncached(
   const octokit = new Octokit({ auth: token });
   const deadlineMs = Date.now() + PER_REPO_DEADLINE_MS;
   const outcome = await fetchCommitHistory(octokit, org, repoName, sinceISO, untilISO, deadlineMs);
-  if (outcome.kind !== "ok") {
-    throw new RepoFetchFailure(`${org}/${repoName}`, outcome);
-  }
   const repoFullName = `${org}/${repoName}`;
+
+  // Decide which commits we have to work with. On a hard error (auth, 404,
+  // etc.) we still throw so the route surfaces the diagnostic. On a deadline
+  // outcome we KEEP the partial commits collected so far and mark the repo
+  // as truncated — losing the data we already paid for makes no sense.
+  let commits: CommitNode[];
+  let truncated = false;
+  let truncationNote: string | undefined;
+  if (outcome.kind === "ok") {
+    commits = outcome.commits;
+  } else if (outcome.kind === "deadline") {
+    commits = outcome.partial;
+    truncated = true;
+    truncationNote = `Per-repo deadline (${PER_REPO_DEADLINE_MS / 1000}s) reached after ${outcome.pages} GraphQL page(s). Showing the ${outcome.partial.length} commits we collected (most recent first).`;
+    if (commits.length === 0) {
+      throw new RepoFetchFailure(repoFullName, outcome);
+    }
+  } else {
+    throw new RepoFetchFailure(repoFullName, outcome);
+  }
+
   // For each commit, decide whether we need to fetch the per-file diff (only
   // if total adds/dels could contain a file > FILE_LINE_THRESHOLD). REST calls
   // run with their own concurrency limiter so we don't blow the deadline.
-  const adjusted = await withConcurrency(outcome.commits, COMMIT_DETAIL_CONCURRENCY, async (c) => {
+  const adjusted = await withConcurrency(commits, COMMIT_DETAIL_CONCURRENCY, async (c) => {
     if (Date.now() >= deadlineMs) {
-      // Out of time — fall back to GraphQL totals.
       return {
         node: c,
         additions: c.additions,
@@ -489,12 +513,14 @@ async function fetchRepoRaceUncached(
     totalDeletions: aggregate.realTotalDeletions,
     totalCommits: aggregate.realTotalCommits,
     racers: aggregate.racers,
+    truncated: truncated || undefined,
+    truncationNote,
   };
 }
 
 const cachedFetchRepoRace = unstable_cache(
   fetchRepoRaceUncached,
-  ["repo-race-graphql-v3-coauthors"],
+  ["repo-race-graphql-v4-partial"],
   { revalidate: 60 * 60, tags: ["github-code-race"] }
 );
 
@@ -586,7 +612,20 @@ export async function getOrgRaceData(opts: {
         sinceISO,
         untilISO
       );
-      if (result) repoRaces.push(result);
+      if (result) {
+        repoRaces.push(result);
+        if (result.truncated) {
+          warnings.push({
+            repo: result.fullName,
+            reason: "Partial data — repo had more commits than fit in this request",
+            message:
+              result.truncationNote ??
+              "We collected commits up to the deadline; older commits in this month may be missing.",
+            attempts: 0,
+            lastStatus: 200,
+          });
+        }
+      }
     } catch (err: unknown) {
       if (err instanceof RepoFetchFailure) {
         warnings.push(buildWarning(err.fullName, err.outcome));

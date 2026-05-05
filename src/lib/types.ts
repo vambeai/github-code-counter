@@ -28,6 +28,8 @@ export type RepoRace = {
   totalDeletions: number;
   totalCommits: number;
   racers: Racer[];
+  truncated?: boolean;
+  truncationNote?: string;
 };
 
 export type Warning = {
