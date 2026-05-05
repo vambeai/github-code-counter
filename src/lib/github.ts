@@ -14,19 +14,23 @@ async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// GitHub computes /stats/contributors lazily. The first request for a repo
+// returns 202 and kicks off a background job. We retry up to ~40s, well under
+// the route's 60s maxDuration.
 async function fetchContribStats(
   octokit: Octokit,
   owner: string,
   repo: string
 ): Promise<ContribStat[] | null> {
-  for (let attempt = 0; attempt < 6; attempt++) {
+  const MAX_ATTEMPTS = 12;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
       const res = await octokit.request("GET /repos/{owner}/{repo}/stats/contributors", {
         owner,
         repo,
       });
       if (res.status === 202) {
-        await sleep(1500 + attempt * 500);
+        await sleep(2000 + attempt * 400);
         continue;
       }
       if (!Array.isArray(res.data)) return [];
@@ -35,7 +39,7 @@ async function fetchContribStats(
       const status = (err as { status?: number }).status;
       if (status === 204 || status === 409) return [];
       if (status === 404 || status === 403) throw err;
-      if (attempt === 5) throw err;
+      if (attempt === MAX_ATTEMPTS - 1) throw err;
       await sleep(800);
     }
   }
@@ -138,7 +142,9 @@ export async function getOrgRaceData(opts: {
     try {
       const stats = await fetchContribStats(octokit, org, repo.name);
       if (stats === null) {
-        warnings.push(`${repo.full_name}: stats still computing on GitHub, skipped.`);
+        warnings.push(
+          `${repo.full_name}: GitHub is still building its contributor cache (first-time hit). Hit START again in ~30s and it'll be ready.`
+        );
         return;
       }
       const racers = aggregateWeeks(stats, sinceTs, untilTs);
