@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Bungee&family=Press+Start+2P&display=swap");
+
+html,
+body {
+  background: radial-gradient(ellipse at top, #16213e 0%, #0a0a16 70%);
+  color: #f5f5f5;
+  font-family: system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+}
+
+.race-title {
+  font-family: "Bungee", system-ui, sans-serif;
+  letter-spacing: 0.02em;
+}
+
+.pixel {
+  font-family: "Press Start 2P", system-ui, sans-serif;
+}
+
+@keyframes flag-wave {
+  0%,
+  100% {
+    transform: rotate(-6deg);
+  }
+  50% {
+    transform: rotate(6deg);
+  }
+}
+
+.flag {
+  display: inline-block;
+  animation: flag-wave 1s ease-in-out infinite;
+}
+
+@keyframes track-stripes {
+  to {
+    background-position: -40px 0;
+  }
+}
+
+.track-bg {
+  background-image: repeating-linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.06) 0,
+    rgba(255, 255, 255, 0.06) 20px,
+    transparent 20px,
+    transparent 40px
+  );
+  background-size: 40px 100%;
+}
+
+.track-bg-animated {
+  animation: track-stripes 0.8s linear infinite;
+}
