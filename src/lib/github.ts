@@ -10,13 +10,21 @@ type ContribStat = {
 };
 
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
-// Deadlines sized for Vercel's 60s maxDuration. With concurrency 6, a worker
-// can do at most ceil(N/6) rounds. The pre-dispatch check below skips a repo
-// whenever a fresh PER_REPO_DEADLINE_MS attempt would push past ORG_DEADLINE_MS,
-// so we never run into FUNCTION_INVOCATION_TIMEOUT. Cache hits return instantly,
-// so the per-repo deadline only applies when actually calling GitHub.
-const PER_REPO_DEADLINE_MS = 15_000;
-const ORG_DEADLINE_MS = 47_000;
+// Strategy (informed by GitHub Community discussion #190711):
+//
+//  * GitHub's /stats/contributors background-job queue gets overwhelmed when
+//    you fire many concurrent requests, so 202s become *persistent*. Their
+//    own best-practices say "make requests serially, not concurrently."
+//  * We compromise: low concurrency in the main fetch (3 in flight) with
+//    short per-repo budget (5s, ~3 quick attempts), so the user gets a fast
+//    response with warnings for anything still cold.
+//  * Then `after()` runs a strictly serial warmer (1.5s between repos, ONE
+//    poke each — no polling), which lets GitHub's queue drain. By the next
+//    user race (30-60s later), the cache is hot and everything 200s.
+const PER_REPO_DEADLINE_MS = 5_000;
+const ORG_DEADLINE_MS = 40_000;
+const MAIN_CONCURRENCY = 3;
+const WARMER_GAP_MS = 1_500;
 
 const RATE_LIMIT_HEADERS = [
   "x-ratelimit-limit",
@@ -77,7 +85,10 @@ async function fetchContribStats(
   repo: string,
   deadlineMs: number
 ): Promise<FetchOutcome> {
-  const MAX_ATTEMPTS = 12;
+  // Few quick attempts only. We rely on the after() warmer + a user retry to
+  // catch repos whose stats are still computing (per GitHub's "serial, not
+  // parallel" best practice).
+  const MAX_ATTEMPTS = 3;
   let attempts = 0;
   let lastStatus: number | null = null;
   let lastHeaders: Record<string, string> = {};
@@ -96,7 +107,7 @@ async function fetchContribStats(
         res.headers as Record<string, string | number | undefined>
       );
       if (res.status === 202) {
-        const wait = 2000 + attempt * 400;
+        const wait = 1200 + attempt * 400; // 1.2s, 1.6s, 2.0s
         if (Date.now() + wait >= deadlineMs) {
           return { kind: "deadline", attempts, lastStatus, headers: lastHeaders };
         }
@@ -354,7 +365,7 @@ export async function getOrgRaceData(opts: {
   const repoRaces: RepoRace[] = [];
   const orgDeadlineMs = Date.now() + ORG_DEADLINE_MS;
 
-  await withConcurrency(candidates, 6, async (repo) => {
+  await withConcurrency(candidates, MAIN_CONCURRENCY, async (repo) => {
     // Skip if a fresh per-repo attempt wouldn't fit within the remaining org
     // budget — this is what prevents FUNCTION_INVOCATION_TIMEOUT on Vercel.
     // Cache hits don't take real time, so we approximate "fresh attempt" with
@@ -446,42 +457,39 @@ export async function getCachedOrgRaceData(
   return getOrgRaceData({ org, since, until });
 }
 
-// Fire-and-forget warmer: keeps poking GitHub's /stats/contributors for the
-// repos that came back as 202 in the user-facing race, so the next race finds
-// GitHub's cache hot. Runs inside Next.js `after()`. Returns the list of
-// repos that actually became ready during the warm window.
+// Strictly-serial cache warmer. Per GitHub Community discussion #190711, the
+// /stats/contributors endpoint's background-job queue gets overwhelmed by
+// concurrent requests; the official guidance is "make requests serially, not
+// concurrently." We poke each repo once with a small gap, accept whatever
+// status comes back, and move on. By the time the user retries the race
+// (UI default: 60s countdown), GitHub will have computed everything.
 export async function warmFailedRepos(
   org: string,
   repoNames: string[],
   budgetMs: number
-): Promise<{ ready: string[]; stillCold: string[] }> {
+): Promise<{ poked: string[]; skipped: string[] }> {
   const token = process.env.GITHUB_TOKEN;
-  if (!token) return { ready: [], stillCold: repoNames };
+  if (!token) return { poked: [], skipped: repoNames };
   const octokit = new Octokit({ auth: token });
   const deadline = Date.now() + budgetMs;
-  const ready: string[] = [];
-  const stillCold: string[] = [];
-  await Promise.all(
-    repoNames.map(async (repoName) => {
-      while (Date.now() < deadline) {
-        try {
-          const res = await octokit.request("GET /repos/{owner}/{repo}/stats/contributors", {
-            owner: org,
-            repo: repoName,
-          });
-          if (res.status !== 202) {
-            ready.push(repoName);
-            return;
-          }
-        } catch {
-          stillCold.push(repoName);
-          return;
-        }
-        if (Date.now() + 4000 >= deadline) break;
-        await sleep(4000);
-      }
-      stillCold.push(repoName);
-    })
-  );
-  return { ready, stillCold };
+  const poked: string[] = [];
+  const skipped: string[] = [];
+  for (const repoName of repoNames) {
+    if (Date.now() >= deadline) {
+      skipped.push(repoName);
+      continue;
+    }
+    try {
+      await octokit.request("GET /repos/{owner}/{repo}/stats/contributors", {
+        owner: org,
+        repo: repoName,
+      });
+      poked.push(repoName);
+    } catch {
+      skipped.push(repoName);
+    }
+    if (Date.now() + WARMER_GAP_MS >= deadline) continue;
+    await sleep(WARMER_GAP_MS);
+  }
+  return { poked, skipped };
 }

@@ -65,11 +65,13 @@ export default function Warnings({
 }
 
 function RetryButton({ onRetry, retrying }: { onRetry: () => void; retrying: boolean }) {
-  // After mount, count down 30s and enable a "Retry now" affordance.
-  const [secondsLeft, setSecondsLeft] = useState(30);
+  // Per GitHub's docs and community guidance (#190711), give the background
+  // jobs ~60s to complete before retrying. Users can still click sooner.
+  const COUNTDOWN_S = 60;
+  const [secondsLeft, setSecondsLeft] = useState(COUNTDOWN_S);
   useEffect(() => {
     if (retrying) return;
-    setSecondsLeft(30);
+    setSecondsLeft(COUNTDOWN_S);
     const id = setInterval(() => {
       setSecondsLeft((s) => Math.max(0, s - 1));
     }, 1000);
