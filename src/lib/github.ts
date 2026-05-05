@@ -3,19 +3,22 @@ import { unstable_cache } from "next/cache";
 import type { CommitInfo, Racer, RaceData, RepoRace, Warning } from "./types";
 
 // Budget tuning for Vercel's 60s maxDuration:
-//  * For month mode we now slice a repo's request into ~5 parallel weekly
-//    GraphQL queries (see fetchCommitHistoryWindowed). That collapses the
-//    per-repo wall clock from "8 sequential pages" to "max(weeks) ≈ 1-2
-//    pages", making 12s per repo a comfortable budget for huge orgs.
-//  * Concurrency 8 + per-repo 12s + listing ~2s = 21 repos in 3 rounds = ~38s.
-//  * Org deadline 50s leaves safe margin under maxDuration.
+//  * Per-repo we slice the requested date range into 2-day windows fetched
+//    in parallel via Promise.all (see fetchCommitHistoryWindowed). For a
+//    typical 7-day week that's ~4 parallel queries; for the heaviest repos
+//    each window carries 100-200 commits = 1-2 pages instead of 4-5.
+//  * Result: per-repo wall clock drops to ~max(window_pagination), letting
+//    a 12s budget comfortably handle even vambeai-backend-class repos.
+//  * Concurrency 8, 21 repos in 3 rounds * ~10s + listing ~2s = ~32s. Org
+//    deadline 50s leaves clean margin under the 60s maxDuration.
 //  * Partial pagination data is preserved (truncated=true) instead of thrown
 //    away if any single window's deadline still hits.
 const PER_REPO_DEADLINE_MS = 12_000;
 const ORG_DEADLINE_MS = 50_000;
 const MAIN_CONCURRENCY = 8;
 const MAX_PAGES_PER_REPO = 10;
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const WINDOW_DAYS = 2;
+const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
 // Per-file (NOT per-commit) threshold. Any single file in a commit whose
 // additions OR deletions exceed this is excluded — lockfiles, generated
 // code, vendored deps, large data dumps, etc. The rest of the commit's
@@ -167,7 +170,7 @@ async function fetchCommitHistory(
   return { kind: "ok", commits: all, pages, truncated: true };
 }
 
-function computeWeekWindows(
+function computeRangeWindows(
   since: Date,
   until: Date
 ): Array<{ since: Date; until: Date }> {
@@ -175,11 +178,10 @@ function computeWeekWindows(
   let cursorMs = since.getTime();
   const untilMs = until.getTime();
   while (cursorMs < untilMs) {
-    const endMs = Math.min(cursorMs + WEEK_MS, untilMs);
+    const endMs = Math.min(cursorMs + WINDOW_MS, untilMs);
     windows.push({ since: new Date(cursorMs), until: new Date(endMs) });
     cursorMs = endMs;
   }
-  // Edge case: if range is < 1 day, ensure at least one window.
   if (windows.length === 0) windows.push({ since, until });
   return windows;
 }
@@ -196,7 +198,7 @@ async function fetchCommitHistoryWindowed(
   untilISO: string,
   deadlineMs: number
 ): Promise<FetchOutcome> {
-  const windows = computeWeekWindows(new Date(sinceISO), new Date(untilISO));
+  const windows = computeRangeWindows(new Date(sinceISO), new Date(untilISO));
   if (windows.length <= 1) {
     return fetchCommitHistory(octokit, owner, name, sinceISO, untilISO, deadlineMs);
   }
@@ -608,7 +610,7 @@ async function fetchRepoRaceUncached(
 
 const cachedFetchRepoRace = unstable_cache(
   fetchRepoRaceUncached,
-  ["repo-race-graphql-v5-windowed"],
+  ["repo-race-graphql-v6-2d-windows"],
   { revalidate: 60 * 60, tags: ["github-code-race"] }
 );
 

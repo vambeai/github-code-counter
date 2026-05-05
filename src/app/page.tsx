@@ -3,13 +3,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { format, startOfWeek, endOfWeek } from "date-fns";
 import OrgForm from "@/components/OrgForm";
-import { type DateRangeValue } from "@/components/DateRangePicker";
 import RaceTrack from "@/components/RaceTrack";
 import RepoBreakdown from "@/components/RepoBreakdown";
 import Scoreboard from "@/components/Scoreboard";
 import Warnings from "@/components/Warnings";
 import { loadSavedOrg } from "@/lib/storage";
-import type { RaceData } from "@/lib/types";
+import type { DateRangeValue, RaceData } from "@/lib/types";
 
 function fmtNum(n: number) {
   return n.toLocaleString("en-US");
