@@ -36,6 +36,7 @@ type CommitNode = {
   additions: number;
   deletions: number;
   committedDate: string;
+  parents: { totalCount: number };
   author: {
     user: { login: string; avatarUrl: string; url: string } | null;
     name: string | null;
@@ -83,6 +84,9 @@ const COMMIT_HISTORY_QUERY = /* GraphQL */ `
                 additions
                 deletions
                 committedDate
+                parents {
+                  totalCount
+                }
                 author {
                   user {
                     login
@@ -478,6 +482,12 @@ function aggregateAdjusted(
 
   for (const ac of commits) {
     const c = ac.node;
+    // Skip merge commits. Their additions are the cumulative diff of the
+    // merged branch and are already credited to the individual commits on
+    // that branch (which are also in this history). Counting them would
+    // double-count lines AND attribute them to whoever clicked "Merge"
+    // instead of the people who actually wrote the code.
+    if (c.parents && c.parents.totalCount > 1) continue;
     const contributors = resolveContributors(c, emailToUser);
     if (contributors.length === 0) continue;
 
@@ -610,7 +620,7 @@ async function fetchRepoRaceUncached(
 
 const cachedFetchRepoRace = unstable_cache(
   fetchRepoRaceUncached,
-  ["repo-race-graphql-v6-2d-windows"],
+  ["repo-race-graphql-v7-no-merges"],
   { revalidate: 60 * 60, tags: ["github-code-race"] }
 );
 
