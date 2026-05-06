@@ -620,7 +620,7 @@ async function fetchRepoRaceUncached(
 
 const cachedFetchRepoRace = unstable_cache(
   fetchRepoRaceUncached,
-  ["repo-race-graphql-v7-no-merges"],
+  ["repo-race-graphql-v8-threshold-5k"],
   { revalidate: 60 * 60, tags: ["github-code-race"] }
 );
 
