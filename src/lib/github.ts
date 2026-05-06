@@ -23,7 +23,7 @@ const WINDOW_MS = WINDOW_DAYS * 24 * 60 * 60 * 1000;
 // additions OR deletions exceed this is excluded — lockfiles, generated
 // code, vendored deps, large data dumps, etc. The rest of the commit's
 // files still count.
-const FILE_LINE_THRESHOLD = 10_000;
+const FILE_LINE_THRESHOLD = 5_000;
 const COMMIT_DETAIL_CONCURRENCY = 4;
 // Cap the per-author commit list we ship to the client.
 const MAX_COMMITS_PER_AUTHOR = 200;
