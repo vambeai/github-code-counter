@@ -73,6 +73,13 @@ export async function GET(req: NextRequest) {
   let since: Date;
   let until: Date;
 
+  if (Boolean(sinceParam) !== Boolean(untilParam)) {
+    return NextResponse.json(
+      { error: "Provide both since and until (YYYY-MM-DD)." },
+      { status: 400 }
+    );
+  }
+
   if (sinceParam && untilParam) {
     const s = parseISODate(sinceParam);
     const u = parseISODate(untilParam);
@@ -117,7 +124,11 @@ export async function GET(req: NextRequest) {
         return NextResponse.json({ error: "Invalid month. Use YYYY-MM." }, { status: 400 });
       }
       year = parseInt(m[1], 10);
-      month = parseInt(m[2], 10) - 1;
+      const monthNum = parseInt(m[2], 10);
+      if (monthNum < 1 || monthNum > 12) {
+        return NextResponse.json({ error: "Month must be 01-12." }, { status: 400 });
+      }
+      month = monthNum - 1;
     }
     since = new Date(Date.UTC(year, month, 1, 0, 0, 0));
     until = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0));

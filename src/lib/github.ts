@@ -116,6 +116,7 @@ type FetchOutcome =
       kind: "deadline";
       pages: number;
       partial: CommitNode[];
+      note?: string;
     }
   | {
       kind: "error";
@@ -221,6 +222,7 @@ async function fetchCommitHistoryWindowed(
 
   let totalPages = 0;
   let anyTruncated = false;
+  let failedWindows = 0;
   let firstError: Extract<FetchOutcome, { kind: "error" }> | null = null;
   const allCommits: CommitNode[] = [];
 
@@ -232,8 +234,9 @@ async function fetchCommitHistoryWindowed(
     } else if (r.kind === "deadline") {
       allCommits.push(...r.partial);
       anyTruncated = true;
-    } else if (!firstError) {
-      firstError = r;
+    } else {
+      failedWindows += 1;
+      if (!firstError) firstError = r;
     }
   }
 
@@ -248,6 +251,14 @@ async function fetchCommitHistoryWindowed(
     return true;
   });
 
+  if (failedWindows > 0) {
+    return {
+      kind: "deadline",
+      pages: totalPages,
+      partial: unique,
+      note: `${failedWindows} of ${results.length} time window(s) failed (${firstError?.message ?? "error"}); showing partial results.`,
+    };
+  }
   if (anyTruncated) {
     return { kind: "deadline", pages: totalPages, partial: unique };
   }
@@ -261,8 +272,12 @@ function buildWarning(
   if (outcome.kind === "deadline") {
     return {
       repo: repoFullName,
-      reason: `Per-repo deadline reached after ${outcome.pages} GraphQL page(s)`,
-      message: `Got ${outcome.partial.length} commits before time ran out. Hit Retry — successful repos will be served from cache so this one gets the full budget.`,
+      reason: outcome.note
+        ? "Partial data — one or more time windows failed"
+        : `Per-repo deadline reached after ${outcome.pages} GraphQL page(s)`,
+      message:
+        outcome.note ??
+        `Got ${outcome.partial.length} commits before time ran out. Hit Retry — successful repos will be served from cache so this one gets the full budget.`,
       attempts: outcome.pages,
       lastStatus: 200,
     };
@@ -374,8 +389,10 @@ function buildEmailToUserMap(
   for (const ac of commits) {
     const author = ac.node.author;
     if (!author?.user || !author.email) continue;
-    if (!map.has(author.email)) {
-      map.set(author.email, {
+    const normalizedEmail = author.email.trim().toLowerCase();
+    if (!normalizedEmail) continue;
+    if (!map.has(normalizedEmail)) {
+      map.set(normalizedEmail, {
         login: author.user.login,
         avatarUrl: author.user.avatarUrl,
         htmlUrl: author.user.url,
@@ -396,7 +413,7 @@ function resolveContributors(
   const author = c.author;
   if (author) {
     if (author.user) {
-      const key = author.user.login;
+      const key = `gh:${author.user.login.toLowerCase()}`;
       if (!seen.has(key)) {
         seen.add(key);
         contributors.push({
@@ -407,19 +424,20 @@ function resolveContributors(
         });
       }
     } else if (author.email || author.name) {
-      const email = author.email ?? "";
+      const email = (author.email ?? "").trim();
+      const normalizedEmail = email.toLowerCase();
       const name = author.name ?? "anonymous";
-      const resolved = email ? emailToUser.get(email) : undefined;
+      const resolved = normalizedEmail ? emailToUser.get(normalizedEmail) : undefined;
       const key = resolved
-        ? resolved.login
-        : email
-          ? `email:${email}`
-          : `name:${name}`;
+        ? `gh:${resolved.login.toLowerCase()}`
+        : normalizedEmail
+          ? `email:${normalizedEmail}`
+          : `name:${name.trim().toLowerCase()}`;
       if (!seen.has(key)) {
         seen.add(key);
         contributors.push(
           resolved
-            ? { key: resolved.login, ...resolved }
+            ? { key, ...resolved }
             : { key, login: name, avatarUrl: "", htmlUrl: "#" }
         );
       }
@@ -432,6 +450,7 @@ function resolveContributors(
     let resolvedAvatar = "";
     let resolvedHtml = "#";
 
+    const normalizedEmail = ca.email.trim().toLowerCase();
     // 1) noreply pattern (most reliable — used by GitHub PR suggestions).
     const noreplyLogin = loginFromNoreplyEmail(ca.email);
     if (noreplyLogin) {
@@ -440,8 +459,8 @@ function resolveContributors(
       resolvedHtml = `https://github.com/${noreplyLogin}`;
     }
     // 2) email -> user map built from primary authors in this repo.
-    if (!resolvedLogin) {
-      const found = emailToUser.get(ca.email);
+    if (!resolvedLogin && normalizedEmail) {
+      const found = emailToUser.get(normalizedEmail);
       if (found) {
         resolvedLogin = found.login;
         resolvedAvatar = found.avatarUrl;
@@ -449,7 +468,7 @@ function resolveContributors(
       }
     }
 
-    const key = resolvedLogin ? resolvedLogin : `email:${ca.email}`;
+    const key = resolvedLogin ? `gh:${resolvedLogin.toLowerCase()}` : `email:${normalizedEmail}`;
     if (seen.has(key)) continue; // dedupe (e.g. someone listed as both primary and co-author)
     seen.add(key);
 
@@ -580,7 +599,9 @@ async function fetchRepoRaceUncached(
   } else if (outcome.kind === "deadline") {
     commits = outcome.partial;
     truncated = true;
-    truncationNote = `Per-repo deadline (${PER_REPO_DEADLINE_MS / 1000}s) reached after ${outcome.pages} GraphQL page(s). Showing the ${outcome.partial.length} commits we collected (most recent first).`;
+    truncationNote =
+      outcome.note ??
+      `Per-repo deadline (${PER_REPO_DEADLINE_MS / 1000}s) reached after ${outcome.pages} GraphQL page(s). Showing the ${outcome.partial.length} commits we collected (most recent first).`;
     if (commits.length === 0) {
       throw new RepoFetchFailure(repoFullName, outcome);
     }
@@ -753,7 +774,11 @@ export async function getOrgRaceData(opts: {
   const orgRacerMap = new Map<string, Racer>();
   for (const repoRace of repoRaces) {
     for (const r of repoRace.racers) {
-      const existing = orgRacerMap.get(r.login);
+      const racerKey =
+        r.htmlUrl && r.htmlUrl !== "#"
+          ? `gh:${r.login.toLowerCase()}`
+          : `unlinked:${r.login.trim().toLowerCase()}`;
+      const existing = orgRacerMap.get(racerKey);
       if (existing) {
         existing.additions += r.additions;
         existing.deletions += r.deletions;
@@ -763,7 +788,7 @@ export async function getOrgRaceData(opts: {
           existing.commitList.push(...r.commitList);
         }
       } else {
-        orgRacerMap.set(r.login, {
+        orgRacerMap.set(racerKey, {
           ...r,
           commitList: r.commitList ? [...r.commitList] : undefined,
         });
